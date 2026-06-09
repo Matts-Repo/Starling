@@ -41,7 +41,7 @@ def save_maps(path, maps, scan_params=None, extra_attrs=None):
         if scan_params is not None:
             f.attrs["scan_params"] = json.dumps(_jsonable(scan_params))
         f.attrs["starling_version"] = starling.__version__
-        f.attrs["torch_version"] = torch.__version__
+        f.attrs["torch_version"] = str(torch.__version__)
         f.attrs["timestamp"] = datetime.datetime.now().isoformat()
         for k, v in (extra_attrs or {}).items():
             f.attrs[k] = v
