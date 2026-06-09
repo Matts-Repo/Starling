@@ -95,20 +95,32 @@ def process_scan(entry, recipe, device):
 
     maps = {}
     opts = recipe.fit_options
+    n_motor_dims = dset.data.ndim - 2
     if "moments" in recipe.fits:
         mean, cov = dset.moments()
         maps["mean"] = mean
         maps["covariance"] = cov
+    # 1D fits need a single motor dimension, the 2D fit needs two — skip
+    # (with a note) rather than failing the whole scan
     if "gauss1d" in recipe.fits:
-        maps["gauss1d"] = {
-            "params": dset.fit_1D_gaussian(**(opts.get("gauss1d") or {}))
-        }
+        if n_motor_dims == 1:
+            maps["gauss1d"] = {
+                "params": dset.fit_1D_gaussian(**(opts.get("gauss1d") or {}))
+            }
+        else:
+            print(f"  [note] gauss1d skipped: scan has {n_motor_dims} motor dims")
     if "gauss2p" in recipe.fits:
-        maps["gauss2p"] = dset.fit_two_gaussians_1D(**(opts.get("gauss2p") or {}))
+        if n_motor_dims == 1:
+            maps["gauss2p"] = dset.fit_two_gaussians_1D(**(opts.get("gauss2p") or {}))
+        else:
+            print(f"  [note] gauss2p skipped: scan has {n_motor_dims} motor dims")
     if "gauss2d" in recipe.fits:
-        maps["gauss2d"] = {
-            "params": dset.fit_2D_gaussian(**(opts.get("gauss2d") or {}))
-        }
+        if n_motor_dims == 2:
+            maps["gauss2d"] = {
+                "params": dset.fit_2D_gaussian(**(opts.get("gauss2d") or {}))
+            }
+        else:
+            print(f"  [note] gauss2d skipped: scan has {n_motor_dims} motor dims")
     if roi is not None:
         maps["roi"] = np.asarray(roi)
 
@@ -147,6 +159,12 @@ def aggregate_timeseries(result_files, out_path):
             if "gauss2p" in maps:
                 n_peaks = maps["gauss2p/n_peaks"][()]
                 add("two_peak_fraction", float((n_peaks == 2).mean()))
+            if "gauss2d" in maps:
+                p = maps["gauss2d/params"][()]
+                ok = p[..., 7] > 0
+                for col, name in ((1, "gauss2d_mu0_median"), (2, "gauss2d_mu1_median")):
+                    add(name, float(np.median(p[..., col][ok])) if ok.any() else np.nan)
+                add("gauss2d_success_fraction", float(ok.mean()))
             if "mean" in maps:
                 add("com_mean", float(np.nanmean(maps["mean"][()])))
 

@@ -11,6 +11,20 @@ from .. import preprocess, properties
 from ..device import get_device
 
 
+class _PartialScan:
+    """Minimal darling.DataSet stand-in for partially acquired scans."""
+
+    def __init__(self, data, motors, h5file, scan_id, info):
+        self.data = data
+        self.motors = motors
+        self.h5file = h5file
+        self.scan_params = {"scan_id": scan_id, **info}
+
+    def info(self):
+        for k, v in self.scan_params.items():
+            print(f"{k:<20} :  {str(v):<30}")
+
+
 class DataSet:
     """A DFXM scan with GPU-accelerated analysis.
 
@@ -33,18 +47,43 @@ class DataSet:
         roi=None,
         device=None,
         verbose=True,
+        allow_partial=False,
     ):
         import darling
 
-        self._dset = darling.DataSet(
-            data_source,
-            scan_id=scan_id,
-            suffix=suffix,
-            scan_motor=scan_motor,
-            roi=roi,
-            verbose=verbose,
-        )
         self.device = get_device(device)
+        self.partial_info = None
+
+        if allow_partial:
+            from ._partial import load_partial_scan
+
+            data, motors, info = load_partial_scan(data_source, scan_id, roi=roi)
+            self._dset = _PartialScan(data, motors, data_source, scan_id, info)
+            self.partial_info = info
+            if verbose and not info["complete"]:
+                print(
+                    f"partial scan {scan_id}: using {info['frames_used']}/"
+                    f"{info['frames_expected']} frames -> shape {data.shape}"
+                )
+            return
+
+        try:
+            self._dset = darling.DataSet(
+                data_source,
+                scan_id=scan_id,
+                suffix=suffix,
+                scan_motor=scan_motor,
+                roi=roi,
+                verbose=verbose,
+            )
+        except ValueError as e:
+            if "Could not find" in str(e) and isinstance(data_source, str):
+                raise ValueError(
+                    f"{e}\nThis often means scan {scan_id} was aborted (fewer "
+                    f"frames than the scan command declares). Retry with "
+                    f"DataSet(..., allow_partial=True) to load the complete prefix."
+                ) from e
+            raise
 
     @property
     def data(self):

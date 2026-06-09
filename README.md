@@ -54,3 +54,11 @@ and output layout.
 - First call per (model, shape) pays a torch.compile warm-up of a few seconds;
   subsequent calls are fast. Benchmarks: `python benchmarks/bench.py [--full]`.
 - Golden test against real data: `STARLING_GOLDEN_H5=/path/to/master.h5 pytest tests/test_golden_real_scan.py`.
+
+## Aborted scans
+
+Beamline scans that abort mid-acquisition (frame count < scan command) load
+with `DataSet(..., allow_partial=True)`: the complete fast-motor rows are
+kept, snake-ordering is fixed, and `dset.partial_info` reports
+frames_used/frames_expected. Verified byte-identical to darling on complete
+scans.
