@@ -1,17 +1,22 @@
 # starling
 
-GPU-accelerated DFXM analysis for ESRF ID03 data — the GPU sibling of
-[darling](https://github.com/AxelHenningsson/darling), with a
-darling-compatible API. One PyTorch codebase runs on CUDA (ESRF GPU nodes),
-Apple Silicon (MPS) and CPU; the device is detected automatically.
+GPU-accelerated DFXM analysis for ESRF ID03 data, with a
+[darling](https://github.com/AxelHenningsson/darling)-compatible API.
+One PyTorch codebase runs on CUDA (ESRF GPU nodes), Apple Silicon (MPS) and
+CPU; the device is detected automatically. Fully standalone — the ID03 BLISS
+reading layer (scan-command parsing, snake-scan readers, amesh support) is
+built in.
 
 ## Install
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
-pip install -e /path/to/darling      # local checkout — carries ID03 beamline patches
 pip install -e .
 ```
+
+darling is **not** required. If a darling checkout happens to be importable,
+the test suite additionally runs numerical parity tests against it
+(`tests/test_parity_*.py`, plus byte-equality of the loaders on real scans).
 
 ## Interactive use (beamline)
 

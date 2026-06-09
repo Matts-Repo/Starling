@@ -1,8 +1,9 @@
 import numpy as np
 import pytest
 
-import darling
 import starling
+
+darling = pytest.importorskip("darling", reason="parity reference (optional dev dep)")
 
 
 @pytest.mark.parametrize("device", ["cpu", None])

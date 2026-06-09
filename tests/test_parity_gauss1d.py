@@ -1,8 +1,9 @@
 import numpy as np
 import pytest
 
-import darling
 import starling
+
+darling = pytest.importorskip("darling", reason="parity reference (optional dev dep)")
 
 
 def synthetic_stack(seed=3, ny=48, nx=48, N=40):

@@ -23,9 +23,24 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def test_golden_vendored_loader_matches_darling():
+    """The vendored BLISS reader loads byte-identically to darling.DataSet."""
+    darling = pytest.importorskip("darling")
+    import starling
+
+    roi = (900, 1100, 900, 1100)
+    s = starling.DataSet(GOLDEN, scan_id=SCAN, roi=roi, verbose=False)
+    d = darling.DataSet(GOLDEN, scan_id=SCAN, roi=roi, verbose=False)
+    np.testing.assert_array_equal(s.data, d.data)
+    np.testing.assert_allclose(s.motors, d.motors)
+    assert list(s.scan_params["motor_names"]) == list(d.scan_params["motor_names"])
+    assert list(s.scan_params["scan_shape"]) == list(d.scan_params["scan_shape"])
+    assert s.scan_params["data_name"] == d.scan_params["data_name"]
+
+
 def test_golden_strain_sweep_parity():
     """Strain sweep (ccmth x mu): moments + per-layer 1D fit vs darling."""
-    import darling
+    darling = pytest.importorskip("darling")
     import starling
 
     sset = starling.DataSet(GOLDEN, scan_id=SCAN, verbose=False)
@@ -73,7 +88,7 @@ def test_golden_partial_matches_darling_on_complete_scan():
     """On a complete scan the partial loader is byte-identical to darling."""
     if not os.path.exists(MOSA):
         pytest.skip("mosa master not reachable")
-    import darling
+    darling = pytest.importorskip("darling")
     from starling.io import load_partial_scan
 
     roi = (900, 1100, 900, 1100)
