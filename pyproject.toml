@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "starling"
+version = "0.1.0"
+description = "GPU-accelerated DFXM analysis (PyTorch backend, darling-compatible API)"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.3",
+    "numpy",
+    "h5py",
+    "hdf5plugin",
+    "pyyaml",
+    "tqdm",
+    "psutil",
+    "scipy",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "matplotlib"]
+
+[project.scripts]
+starling = "starling.batch.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["starling*"]

@@ -1,0 +1,61 @@
+"""Hardware detection, memory budgeting and chunk planning.
+
+starling auto-selects the fastest available torch device (cuda > mps > cpu).
+Override with the ``device=`` keyword on any public function or the
+``STARLING_DEVICE`` environment variable (e.g. ``STARLING_DEVICE=cpu``).
+"""
+
+import os
+
+import psutil
+import torch
+
+
+def get_device(prefer=None):
+    """Resolve the compute device.
+
+    Args:
+        prefer (str or torch.device, optional): explicit device request,
+            e.g. "cuda", "mps", "cpu". Defaults to None (auto-detect).
+
+    Returns:
+        torch.device
+    """
+    if isinstance(prefer, torch.device):
+        return prefer
+    name = prefer or os.environ.get("STARLING_DEVICE")
+    if name:
+        return torch.device(name)
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def memory_budget(device):
+    """Bytes of memory usable for tensors on the given device."""
+    if device.type == "cuda":
+        free, _total = torch.cuda.mem_get_info(device)
+        return int(free * 0.8)
+    if device.type == "mps":
+        try:
+            rec = torch.mps.recommended_max_memory() - torch.mps.current_allocated_memory()
+            if rec > 0:
+                return int(rec)
+        except Exception:
+            pass
+        return int(psutil.virtual_memory().available * 0.6)
+    return int(psutil.virtual_memory().available * 0.5)
+
+
+def plan_chunks(n_pixels, bytes_per_pixel, device, safety=0.5):
+    """Number of pixels to process per chunk given the device memory budget."""
+    budget = memory_budget(device) * safety
+    chunk = int(budget // max(1, bytes_per_pixel))
+    return max(1, min(n_pixels, chunk))
+
+
+def compute_dtype(device):
+    """float32 on GPU (MPS has no float64), float64 on CPU."""
+    return torch.float32 if device.type in ("cuda", "mps") else torch.float64
