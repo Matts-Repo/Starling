@@ -106,6 +106,25 @@ class DataSet:
             device=self.device,
         )
 
+    def fit_two_gaussians_1D(self, n_iter_gauss_newton=12, mask=None, delta_bic=10.0):
+        return properties.fit_two_gaussians_1D(
+            self.data,
+            self.motors,
+            n_iter_gauss_newton=n_iter_gauss_newton,
+            mask=mask,
+            delta_bic=delta_bic,
+            device=self.device,
+        )
+
+    def fit_2D_gaussian(self, n_iter_gauss_newton=10, mask=None):
+        return properties.fit_2D_gaussian(
+            self.data,
+            self.motors,
+            n_iter_gauss_newton=n_iter_gauss_newton,
+            mask=mask,
+            device=self.device,
+        )
+
     def save_maps(self, path, maps, extra_attrs=None):
         from ._output import save_maps
 

@@ -38,7 +38,7 @@ def _get_step(model_and_jac, device):
     return _STEP_CACHE[key]
 
 
-def gauss_newton_batched(y, x, params0, model_and_jac, n_iter=7, lam=1e-4):
+def gauss_newton_batched(y, x, params0, model_and_jac, n_iter=7, lam=1e-4, bounds=None):
     """Fit a batch of curves with damped Gauss-Newton.
 
     Args:
@@ -48,6 +48,9 @@ def gauss_newton_batched(y, x, params0, model_and_jac, n_iter=7, lam=1e-4):
         model_and_jac: callable (params, x) -> (f (P, N), J (P, N, p)).
         n_iter: number of iterations.
         lam: Marquardt damping factor on diag(H).
+        bounds: optional (lo, hi) tensors of shape (p,) — parameters are
+            projected into the box after every step, which prevents runaway
+            divergence in ill-conditioned multi-peak fits.
 
     Returns:
         tuple: params (P, p), success (P,) bool.
@@ -69,6 +72,8 @@ def gauss_newton_batched(y, x, params0, model_and_jac, n_iter=7, lam=1e-4):
             delta, ok = step(y, x, params, lam)
         active = success & ok & torch.isfinite(delta).all(-1)
         params = torch.where(active.unsqueeze(-1), params + delta, params)
+        if bounds is not None:
+            params = torch.clamp(params, bounds[0], bounds[1])
         success = success & ok
 
     success = success & torch.isfinite(params).all(-1)

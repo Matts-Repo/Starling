@@ -1,10 +1,12 @@
 """Vectorised initial-guess routines.
 
 Batched ports of darling.properties.curvefit.estimate_initial_linear_trend
-and _estimate_initial_gaussian_params.
+and _estimate_initial_gaussian_params, plus a top-2 local-maxima seed for the
+two-peak fit (the vectorised analogue of darling's peak labelling).
 """
 
 import torch
+import torch.nn.functional as F
 
 
 def linear_trend(y, x):
@@ -65,3 +67,49 @@ def gaussian_seed(y, x, k_bg, m_bg):
     sigma = torch.where(degenerate, torch.zeros_like(sigma), sigma)
     mu = torch.where(degenerate, torch.zeros_like(mu), mu)
     return A, sigma, mu, degenerate
+
+
+def two_peak_seed(y, x, k_bg, m_bg, sigma_smooth=1.5, min_separation_samples=3):
+    """Seeds for the two-Gaussian fit from the top-2 smoothed local maxima.
+
+    The background-subtracted curve is smoothed with a small Gaussian kernel
+    and its two highest local maxima seed [mu1, mu2]. Curves with only one
+    detected maximum get a degenerate second seed next to the first (the
+    two-peak model then loses BIC selection naturally).
+
+    Args:
+        y: (P, N) tensor (normalised curves).
+        x: (N,) tensor (scaled coordinates, assumed near-uniform).
+        k_bg, m_bg: (P,) linear background estimates.
+        sigma_smooth: smoothing width in samples.
+
+    Returns:
+        tuple: A1, sig1, mu1, A2, sig2, mu2 (each (P,)), has2 (P,) bool.
+    """
+    resid = (y - (k_bg[:, None] * x[None, :] + m_bg[:, None])).clamp_min(0.0)
+    half = max(1, int(3 * sigma_smooth))
+    t = torch.arange(-half, half + 1, device=y.device, dtype=y.dtype)
+    ker = torch.exp(-0.5 * (t / sigma_smooth) ** 2)
+    ker = ker / ker.sum()
+    s = F.conv1d(resid.unsqueeze(1), ker.view(1, 1, -1), padding=half).squeeze(1)
+
+    ismax = torch.zeros_like(s, dtype=torch.bool)
+    ismax[:, 1:-1] = (s[:, 1:-1] > s[:, :-2]) & (s[:, 1:-1] >= s[:, 2:])
+    vals = torch.where(ismax, s, torch.full_like(s, -1.0))
+
+    # first peak, then mask an exclusion window around it before picking the
+    # second — otherwise Poisson noise puts both maxima on the same peak and
+    # the two-Gaussian fit collapses
+    v1, i1 = vals.max(dim=-1)
+    pos = torch.arange(s.shape[-1], device=s.device)
+    excl = (pos[None, :] - i1[:, None]).abs() <= min_separation_samples
+    v2, i2 = torch.where(excl, torch.full_like(vals, -1.0), vals).max(dim=-1)
+
+    step = (x[1] - x[0]).abs()
+    mu1 = x[i1]
+    has2 = v2 > 0
+    mu2 = torch.where(has2, x[i2], mu1 + 2 * step)
+    A1 = v1.clamp_min(1e-3)
+    A2 = torch.where(has2, v2, 0.5 * A1).clamp_min(1e-3)
+    sig = ((mu2 - mu1).abs() / 4.0).clamp_min(step)
+    return A1, sig, mu1, A2, sig.clone(), mu2, has2
