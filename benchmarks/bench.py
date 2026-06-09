@@ -43,8 +43,13 @@ def main():
     mpix = ny * nx / 1e6
     print(f"detector {ny}x{nx} ({mpix:.2f} Mpx), {len(x)} motor points\n")
 
-    import darling
     import starling
+
+    try:
+        import darling
+    except ImportError:
+        darling = None
+        print("darling not importable — skipping comparison rows\n")
 
     devices = ["cpu"]
     if torch.backends.mps.is_available():
@@ -53,23 +58,26 @@ def main():
         devices.append("cuda")
 
     print("== moments ==")
-    t = timeit(lambda: darling.properties.moments(data, coords))
-    print(f"darling (numba)     {t:8.3f} s   {t / mpix:7.3f} s/Mpx")
+    if darling:
+        t = timeit(lambda: darling.properties.moments(data, coords))
+        print(f"darling (numba)     {t:8.3f} s   {t / mpix:7.3f} s/Mpx")
     for dev in devices:
         t = timeit(lambda: starling.properties.moments(data, coords, device=dev))
         print(f"starling ({dev:4s})    {t:8.3f} s   {t / mpix:7.3f} s/Mpx")
 
     print("\n== fit_1D_gaussian ==")
-    t_ref = timeit(lambda: darling.properties.curvefit.fit_1D_gaussian(data, (x,)), repeat=1)
-    print(f"darling (numba)     {t_ref:8.3f} s   {t_ref / mpix:7.3f} s/Mpx")
+    t_ref = None
+    if darling:
+        t_ref = timeit(
+            lambda: darling.properties.curvefit.fit_1D_gaussian(data, (x,)), repeat=1
+        )
+        print(f"darling (numba)     {t_ref:8.3f} s   {t_ref / mpix:7.3f} s/Mpx")
     for dev in devices:
         t = timeit(
             lambda: starling.properties.fit_1D_gaussian(data, (x,), device=dev), repeat=1
         )
-        print(
-            f"starling ({dev:4s})    {t:8.3f} s   {t / mpix:7.3f} s/Mpx   "
-            f"{t_ref / t:5.1f}x vs darling"
-        )
+        ratio = f"   {t_ref / t:5.1f}x vs darling" if t_ref else ""
+        print(f"starling ({dev:4s})    {t:8.3f} s   {t / mpix:7.3f} s/Mpx{ratio}")
 
 
 if __name__ == "__main__":
