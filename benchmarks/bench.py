@@ -1,4 +1,4 @@
-"""Benchmark darling (numba CPU) vs starling (torch cpu/mps/cuda).
+"""Benchmark starling (torch cpu/mps/cuda).
 
 Usage: python benchmarks/bench.py [--full]
     --full uses a 2048x2048 detector (the real PCO frame size); default is
@@ -45,12 +45,6 @@ def main():
 
     import starling
 
-    try:
-        import darling
-    except ImportError:
-        darling = None
-        print("darling not importable — skipping comparison rows\n")
-
     devices = ["cpu"]
     if torch.backends.mps.is_available():
         devices.append("mps")
@@ -58,26 +52,16 @@ def main():
         devices.append("cuda")
 
     print("== moments ==")
-    if darling:
-        t = timeit(lambda: darling.properties.moments(data, coords))
-        print(f"darling (numba)     {t:8.3f} s   {t / mpix:7.3f} s/Mpx")
     for dev in devices:
         t = timeit(lambda: starling.properties.moments(data, coords, device=dev))
         print(f"starling ({dev:4s})    {t:8.3f} s   {t / mpix:7.3f} s/Mpx")
 
     print("\n== fit_1D_gaussian ==")
-    t_ref = None
-    if darling:
-        t_ref = timeit(
-            lambda: darling.properties.curvefit.fit_1D_gaussian(data, (x,)), repeat=1
-        )
-        print(f"darling (numba)     {t_ref:8.3f} s   {t_ref / mpix:7.3f} s/Mpx")
     for dev in devices:
         t = timeit(
             lambda: starling.properties.fit_1D_gaussian(data, (x,), device=dev), repeat=1
         )
-        ratio = f"   {t_ref / t:5.1f}x vs darling" if t_ref else ""
-        print(f"starling ({dev:4s})    {t:8.3f} s   {t / mpix:7.3f} s/Mpx{ratio}")
+        print(f"starling ({dev:4s})    {t:8.3f} s   {t / mpix:7.3f} s/Mpx")
 
 
 if __name__ == "__main__":

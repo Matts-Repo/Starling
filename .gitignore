@@ -5,3 +5,4 @@ __pycache__/
 output/
 *.h5
 *.dar5
+.DS_Store

@@ -1,4 +1,4 @@
-"""starling must be importable and fully functional without darling installed."""
+"""starling must be importable and fully functional as a standalone package."""
 
 import subprocess
 import sys
@@ -7,17 +7,17 @@ from pathlib import Path
 PKG = Path(__file__).resolve().parents[1] / "starling"
 
 
-def test_no_darling_imports_in_package():
+def test_no_external_dfxm_imports_in_package():
     offenders = []
     for py in PKG.rglob("*.py"):
         src = py.read_text()
         if "import darling" in src or "from darling" in src:
             offenders.append(str(py))
-    assert not offenders, f"darling imported in: {offenders}"
+    assert not offenders, f"unexpected external DFXM imports in: {offenders}"
 
 
-def test_import_with_darling_blocked():
-    """Simulate a darling-free environment: block the import and use starling."""
+def test_import_standalone():
+    """starling works with no optional dependencies present."""
     code = """
 import sys
 sys.modules["darling"] = None  # raises ImportError on any 'import darling'

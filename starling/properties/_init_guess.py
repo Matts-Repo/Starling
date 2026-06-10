@@ -1,8 +1,7 @@
 """Vectorised initial-guess routines.
 
-Batched ports of darling.properties.curvefit.estimate_initial_linear_trend
-and _estimate_initial_gaussian_params, plus a top-2 local-maxima seed for the
-two-peak fit (the vectorised analogue of darling's peak labelling).
+Batched linear-trend estimation and Gaussian parameter seed, plus a top-2
+local-maxima seed for the two-peak fit.
 """
 
 import torch
@@ -38,7 +37,7 @@ def gaussian_seed(y, x, k_bg, m_bg):
     """Initial [A, sigma, mu] from weighted moments of the positive residual.
 
     Degenerate curves (no positive residual mass, non-positive variance, or
-    sigma <= 1e-8 — darling's skip conditions) are flagged in the returned mask
+    sigma <= 1e-8) are flagged in the returned mask
     with A = sigma = mu = 0.
 
     Args:

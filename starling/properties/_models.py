@@ -1,7 +1,6 @@
 """Batched torch model + analytic Jacobian evaluators.
 
-Vectorised ports of darling.properties.models. Parameter orders match the
-darling *code* (not its docstrings): gauss1d_lin is [A, sigma, mu, k, m].
+Parameter order for gauss1d_lin: [A, sigma, mu, k, m].
 Built functionally (torch.stack, no slice writes) so torch.compile can fuse
 the elementwise chains.
 """

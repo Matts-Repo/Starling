@@ -1,9 +1,8 @@
 """starling.DataSet — self-contained ID03 BLISS HDF5 loading + GPU analysis.
 
-The ID03 reading layer (metadata parsing, scan readers) is vendored in
-starling.io._metadata / _reader, so starling installs standalone. The data
-layout and loading semantics match darling.DataSet (verified by the parity
-tests, which run when a darling checkout is importable).
+The ID03 reading layer (metadata parsing, scan readers) is built into
+starling.io._metadata / _reader, so starling installs standalone with no
+external DFXM dependencies.
 """
 
 import h5py
@@ -134,7 +133,7 @@ class DataSet:
         return scan_ids
 
     def load_scan(self, scan_id, scan_motor=None, roi=None, verbose=True):
-        """Load a scan (or stack of scans) into RAM in darling layout."""
+        """Load a scan (or stack of scans) into RAM."""
         if not isinstance(scan_id, (list, str)):
             raise ValueError("scan_id must be a list of strings or a single string")
         if isinstance(scan_id, list) and not isinstance(scan_motor, str):

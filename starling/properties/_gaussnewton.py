@@ -1,9 +1,7 @@
 """Generic batched damped Gauss-Newton driver.
 
-Mirrors darling.properties.curvefit.gauss_newton_fit_1D but over a pixel
-batch: per iteration H = J^T J, g = J^T r, damped batched solve. Pixels whose
-solve fails are frozen with success=0 — the batched equivalent of darling's
-per-pixel try/except (darling likewise stops updating a pixel on failure).
+Per iteration: H = J^T J, g = J^T r, damped batched solve over a pixel batch.
+Pixels whose solve fails are frozen with success=0.
 
 The per-iteration step is torch.compile'd: the model/Jacobian evaluation is a
 chain of memory-bound elementwise kernels that fusion speeds up ~10x on MPS.

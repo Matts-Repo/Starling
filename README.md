@@ -1,11 +1,9 @@
 # starling
 
-GPU-accelerated DFXM analysis for ESRF ID03 data, with a
-[darling](https://github.com/AxelHenningsson/darling)-compatible API.
-One PyTorch codebase runs on CUDA (ESRF GPU nodes), Apple Silicon (MPS) and
-CPU; the device is detected automatically. Fully standalone — the ID03 BLISS
-reading layer (scan-command parsing, snake-scan readers, amesh support) is
-built in.
+GPU-accelerated DFXM analysis for ESRF ID03 BLISS data. One PyTorch codebase
+runs on CUDA (ESRF GPU nodes), Apple Silicon (MPS) and CPU; the device is
+detected automatically. Fully standalone — the ID03 BLISS reading layer
+(scan-command parsing, snake-scan readers, amesh support) is built in.
 
 ## Install
 
@@ -13,10 +11,6 @@ built in.
 python -m venv .venv && source .venv/bin/activate
 pip install -e .
 ```
-
-darling is **not** required. If a darling checkout happens to be importable,
-the test suite additionally runs numerical parity tests against it
-(`tests/test_parity_*.py`, plus byte-equality of the loaders on real scans).
 
 ## Interactive use (beamline)
 
@@ -29,15 +23,11 @@ dset = starling.DataSet("dataset.h5", scan_id="1.1")
 dset.subtract(dset.estimate_background())
 dset.auto_roi()
 
-mean, cov = dset.moments()                  # == darling.properties.moments
+mean, cov = dset.moments()                  # per-pixel COM + covariance
 params = dset.fit_1D_gaussian()             # (ny, nx, 6) [A, sigma, mu, k, m, success]
 out2 = dset.fit_two_gaussians_1D()          # 1 vs 2 peak per pixel, BIC-selected
 p2d = dset.fit_2D_gaussian()                # 2D Gaussian over a mosa grid
 ```
-
-`starling.properties.{moments, fit_1D_gaussian}` accept the same array shapes
-and return the same conventions as darling, so existing notebooks port by
-changing the import. Parity is enforced by `tests/test_parity_*.py`.
 
 ## Batch use (post-experiment)
 
@@ -65,5 +55,4 @@ and output layout.
 Beamline scans that abort mid-acquisition (frame count < scan command) load
 with `DataSet(..., allow_partial=True)`: the complete fast-motor rows are
 kept, snake-ordering is fixed, and `dset.partial_info` reports
-frames_used/frames_expected. Verified byte-identical to darling on complete
-scans.
+frames_used/frames_expected.

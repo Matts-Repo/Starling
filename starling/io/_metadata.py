@@ -1,9 +1,8 @@
-"""ID03 BLISS metadata parsing (vendored from the local darling checkout).
+"""ID03 BLISS metadata parsing.
 
 Parses scan commands (ascan/fscan/fscan2d/amesh/...) from a BLISS master file
 into scan shape, motor h5 paths, integrated-motor flags and the detector data
-key. Includes the local beamline patches (amesh support) that are not in
-upstream darling.
+key. Includes local beamline patches (amesh support).
 """
 
 import h5py

@@ -1,9 +1,9 @@
 """Preprocessing: background estimation/subtraction, auto-ROI, hot pixels.
 
-Background subtraction follows darling.DataSet.subtract semantics
-(clamp-to-background before subtracting so uint16 never wraps). These
-operations are memory-bandwidth bound, so they run in numpy on the host
-where the data already lives; the GPU is reserved for the fitting.
+Background subtraction clamps to the background image before subtracting so
+uint16 never wraps. These operations are memory-bandwidth bound, so they run
+in numpy on the host where the data already lives; the GPU is reserved for
+the fitting.
 """
 
 import numpy as np
@@ -30,7 +30,7 @@ def estimate_background(data, n_lowest=5, mode="mean"):
 
 
 def subtract(data, background):
-    """In-place clamped background subtraction (darling semantics).
+    """In-place clamped background subtraction.
 
     Args:
         data (numpy.ndarray): shape (a, b, ...), unsigned integer dtype.

@@ -1,10 +1,10 @@
 """Loader for partial (aborted) fscan/fscan2d scans.
 
-Beamline scans frequently abort mid-acquisition; darling refuses them because
-the frame count no longer matches the scan command. The complete prefix is
-still good data — e.g. an aborted chi x mu fscan2d whose first chi row is a
-full fine mu rocking sweep. This loader truncates to complete fast-motor rows
-and returns arrays in darling layout.
+Beamline scans frequently abort mid-acquisition; the frame count no longer
+matches the scan command. The complete prefix is still good data — e.g. an
+aborted chi x mu fscan2d whose first chi row is a full fine mu rocking sweep.
+This loader truncates to complete fast-motor rows and returns the standard
+(data, motors) arrays.
 """
 
 import h5py
@@ -31,7 +31,7 @@ def _motor_array(g, name, n_frames):
 
 
 def load_partial_scan(h5file, scan_id, roi=None, detector="pco_ff"):
-    """Load a possibly-aborted fscan/fscan2d in darling layout.
+    """Load a possibly-aborted fscan/fscan2d.
 
     Args:
         h5file (str): BLISS master file path.
@@ -72,7 +72,7 @@ def load_partial_scan(h5file, scan_id, roi=None, detector="pco_ff"):
                 np.moveaxis(frames.reshape(rows, n_fast, *frames.shape[1:]), (0, 1), (2, 3))
             )
             # fscan2d is a snake scan: sort each row to a monotonic fast-motor
-            # grid and rows by slow motor (matches darling's frame reordering)
+            # grid and rows by slow motor
             for r in range(rows):
                 order = np.argsort(fast[r])
                 data[:, :, r, :] = data[:, :, r, order]

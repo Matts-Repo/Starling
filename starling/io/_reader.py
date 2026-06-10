@@ -1,8 +1,8 @@
-"""ID03 scan readers (vendored from the local darling checkout).
+"""ID03 scan readers.
 
-Readers return data in darling layout: data (a, b, m[, n]) uint16 with
-detector dimensions first, and motors (k, m[, n]). Snake/zigzag scans are
-re-sorted onto a monotonically increasing motor grid.
+Readers return data as (a, b, m[, n]) uint16 with detector dimensions first,
+and motors (k, m[, n]). Snake/zigzag scans are re-sorted onto a monotonically
+increasing motor grid.
 """
 
 import h5py
@@ -17,8 +17,8 @@ def _ascontiguousarrays(data, motors):
 
 class Reader:
     """Base reader. Subclass and implement __call__ for custom acquisition
-    schemes; anything returning (data, motors) in darling layout plugs into
-    starling.DataSet."""
+    schemes; anything returning (data, motors) in the standard layout plugs
+    into starling.DataSet."""
 
     def __init__(self, abs_path_to_h5_file):
         self.abs_path_to_h5_file = abs_path_to_h5_file

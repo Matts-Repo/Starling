@@ -1,8 +1,7 @@
-"""Public curve-fitting API, darling-compatible.
+"""Public curve-fitting API.
 
-fit_1D_gaussian matches darling.properties.fit_1D_gaussian: output shape
-(ny, nx, 6) float64 with parameters ordered [A, sigma, mu, k, m, success]
-(the order darling's code actually writes).
+fit_1D_gaussian returns shape (ny, nx, 6) float64 with parameters ordered
+[A, sigma, mu, k, m, success].
 
 float32 GPU stability: motor coordinates are centred/scaled to O(1) and each
 curve is normalised by its maximum before fitting; parameters are transformed
@@ -81,7 +80,7 @@ def fit_1D_gaussian(data, coordinates, n_iter_gauss_newton=7, mask=None, device=
         A0, s0, mu0, degenerate = gaussian_seed(yn, xh, k0, m0)
         # degenerate rows get harmless dummy params and are fitted anyway
         # (keeping the batch shape uniform for torch.compile), then their
-        # outputs are overwritten with darling's convention below
+        # outputs are overwritten with zeros for degenerate pixels below
         s0 = torch.where(degenerate, torch.ones_like(s0), s0)
         params0 = torch.stack([A0, s0, mu0, k0, m0], dim=-1)
 
@@ -102,7 +101,7 @@ def fit_1D_gaussian(data, coordinates, n_iter_gauss_newton=7, mask=None, device=
             ],
             dim=-1,
         )
-        # degenerate pixels keep darling's convention:
+        # degenerate pixels: A = sigma = mu = 0, background from linear trend
         # A = sigma = mu = 0, background from the initial linear trend
         deg = degenerate.unsqueeze(-1)
         res = torch.where(

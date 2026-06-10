@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "starling"
 version = "0.1.0"
-description = "GPU-accelerated DFXM analysis (PyTorch backend, darling-compatible API)"
+description = "GPU-accelerated DFXM analysis for ESRF ID03 BLISS data (PyTorch backend)"
 requires-python = ">=3.10"
 dependencies = [
     "torch>=2.3",

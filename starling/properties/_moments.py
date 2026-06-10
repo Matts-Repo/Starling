@@ -1,6 +1,5 @@
 """GPU weighted first/second moments over arbitrary motor dimensions.
 
-API-compatible with darling.properties.moments / mean / covariance:
 data shape (a, b, m[, n[, o]]), coordinates shape (ndim, m[, n[, o]]),
 zero-intensity pixels map to 0, outputs are squeezed.
 """
@@ -21,7 +20,7 @@ def moments(data, coordinates, device=None):
 
     Returns:
         tuple of numpy.ndarray: mean (a, b[, ndim]) and covariance
-        (a, b[, ndim, ndim]), squeezed like darling.
+        (a, b[, ndim, ndim]), squeezed.
     """
     mu, cov = _moments_full(data, coordinates, device)
     return np.squeeze(mu), np.squeeze(cov)
@@ -35,7 +34,7 @@ def mean(data, coordinates, device=None):
 
 def covariance(data, coordinates, first_moments=None, device=None):
     """Per-pixel intensity-weighted covariance (see moments)."""
-    # first_moments accepted for darling API compatibility; recomputing on GPU
+    # first_moments arg accepted for API compatibility; recomputing on GPU
     # is cheaper than validating/broadcasting a user-supplied array.
     _, cov = _moments_full(data, coordinates, device)
     return np.squeeze(cov)
