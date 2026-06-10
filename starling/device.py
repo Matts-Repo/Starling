@@ -27,7 +27,7 @@ def get_device(prefer=None):
     if name:
         return torch.device(name)
     if torch.cuda.is_available():
-        return torch.device("cuda")
+        return torch.device("cuda", torch.cuda.current_device())
     if torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
@@ -36,7 +36,8 @@ def get_device(prefer=None):
 def memory_budget(device):
     """Bytes of memory usable for tensors on the given device."""
     if device.type == "cuda":
-        free, _total = torch.cuda.mem_get_info(device)
+        idx = device.index if device.index is not None else torch.cuda.current_device()
+        free, _total = torch.cuda.mem_get_info(idx)
         return int(free * 0.8)
     if device.type == "mps":
         try:
