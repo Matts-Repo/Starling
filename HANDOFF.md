@@ -1,15 +1,14 @@
 # HANDOFF — starling for the next beamtime
 
 State of the project as of 2026-06-10, and how to pick it up with fresh data.
-Audience: future me / a fresh Claude session / a colleague at the beamline.
+Audience: future me / a colleague at the beamline.
 
 ## What this is
 
 `starling` is a standalone, GPU-accelerated DFXM analysis package for ESRF
-ID03 BLISS data, API-compatible with darling. PyTorch backend, auto device
-selection (CUDA on ESRF GPU nodes → MPS on Apple Silicon → CPU). The ID03
-reading layer (scan-command parsing, snake-scan readers, amesh support) is
-vendored in — **no darling install required**.
+ID03 BLISS data. PyTorch backend, auto device selection (CUDA on ESRF GPU
+nodes → MPS on Apple Silicon → CPU). The ID03 reading layer
+(scan-command parsing, snake-scan readers, amesh support) is built in.
 
 Repo: `/Users/matt/Lab/projects/DFXM/starling` (own git repo).
 Local venv: `.venv` (Python 3.12, torch 2.12). Install elsewhere with
@@ -20,13 +19,12 @@ Local venv: `.venv` (Python 3.12, torch 2.12). Install elsewhere with
 ```python
 import starling
 
-# 1D/2D scans: same call signature as darling
 dset = starling.DataSet("/path/to/<dataset>/<dataset>.h5", scan_id="1.1")
 dset.info()                                 # scan command, shape, motors
 dset.subtract(dset.estimate_background())   # mean of 5 darkest frames
 dset.auto_roi()                             # crop to the grain (in place)
 
-mean, cov = dset.moments()                  # COM + covariance per pixel
+mean, cov = dset.moments()                  # per-pixel COM + covariance
 params = dset.fit_1D_gaussian()             # (ny,nx,6) [A, sigma, mu, k, m, success]
 out2   = dset.fit_two_gaussians_1D()        # 1 vs 2 peaks per px, BIC-selected
 p2d    = dset.fit_2D_gaussian()             # (ny,nx,8) full 2D Gaussian on mosa grids
@@ -41,13 +39,33 @@ Scan-type cheat sheet (MA6278 conventions):
   `data[:, :, :, k]` with `motors[0, :, k]` and call `fit_1D_gaussian`.
 - **Mosa**: `fscan2d chi ... mu ...` → (a, b, n_chi, n_mu). Use `moments`
   and/or `fit_2D_gaussian`.
-- **3D strain-mosa**: N repeated fscan2d scans stepped in obpitch within one
-  master. Load stacked:
+- **3D strain-mosa**: N repeated fscan2d scans stepped in obpitch (or diffry,
+  ccmth, …) within one master. Load stacked — **this is the supported 3D route;
+  the external VDS/concatenation script is deprecated** (see below):
   ```python
   dset = starling.DataSet(master, scan_id=[f"{i}.1" for i in range(1, 12)],
                           scan_motor="instrument/positioners/obpitch")
-  # data (a, b, n_chi, n_mu, n_obpitch); moments() gives 3D COM per pixel
+  # data (a, b, n_chi, n_mu, n_obpitch)
+  res = dset.analyze()        # GaussNDResult (D=3) — fitted 3D maps, not just moments
+  res.mosaicity(axes=(0, 1))  # spread in the chi,mu orientation block only
   ```
+
+### Retiring concatenation (the VDS script)
+
+`DataSet(master, scan_id=[...], scan_motor=...)` (`_dataset._load_stacked_scans`)
+already assembles the `(ny, nx, n1, n2, n_stack)` cube in memory from the raw
+per-scan entries: it sorts sub-scans by the stack motor, builds the motor
+meshgrid and reads the detector frames directly — preserving the grid structure
+and **avoiding the broken-VDS-reads-zeros problem**. So the external
+`3D_strain_mosa_*_concatenationtest.py` (which built a single HDF5 with a VDS
+over all frames + concatenated positioners — the darfix route) is **no longer
+needed for starling**. Parity is asserted in `tests/test_stacked_load.py`
+(stacked load == hand-built concatenation: same frame count, same per-step motor
+values, identical detector spectra). The one precondition: each sub-scan entry
+must expose its detector dataset and per-frame motor arrays where `io/_reader.py`
+expects them (true for the `repaired_cell_charging` datasets). If a future
+dataset ships only a pre-concatenated `_concat.h5`, point `DataSet` at it with a
+single `scan_id`.
 - **Aborted scans** (frame count < scan command): add `allow_partial=True` —
   keeps complete fast-motor rows, fixes snake ordering, sets
   `dset.partial_info`.
@@ -69,20 +87,19 @@ Read back with `starling.io.load_maps(path)`.
 
 Measured on the M5 Pro 48 GB (MPS), real 2048² PCO data:
 
-| operation | size | time | vs darling-numba |
-|---|---|---|---|
-| fit_1D_gaussian | 600²×80 (ROI) | 0.14 s | 4.8× faster |
-| fit_1D_gaussian | 2048²×80 | 3.2 s | 2.2× faster |
-| fit_1D_gaussian | 2048²×25 (strain sweep layer) | 3.0 s | 1.8× faster |
-| fit_2D_gaussian | 2048²×(25×20) | 17 s | n/a (darfix takes minutes) |
-| moments 3D | 2048²×(12×5×11) | 5.8 s | n/a |
-| batch scan (moments+gauss2d, full frame) | 60 frames | ~12.5 s | — |
+| operation | size | time (M5 Pro MPS) |
+|---|---|---|
+| fit_1D_gaussian | 600²×80 (ROI) | 0.14 s |
+| fit_1D_gaussian | 2048²×80 | 3.2 s |
+| fit_1D_gaussian | 2048²×25 (strain sweep layer) | 3.0 s |
+| fit_2D_gaussian | 2048²×(25×20) | 17 s |
+| moments 3D | 2048²×(12×5×11) | 5.8 s |
+| batch scan (moments+gauss2d, full frame) | 60 frames | ~12.5 s |
 
 Notes:
 - First fit call per (model, chunk shape) pays a ~5–10 s torch.compile
   warm-up; subsequent calls are fast. Don't benchmark the first call.
-- `moments` on multi-GB stacks is transfer-bound on MPS and can be slightly
-  slower than numba — known, accepted, should invert on CUDA.
+- `moments` on multi-GB stacks is transfer-bound on MPS; should invert on CUDA.
 - **CUDA is untested.** First thing at ESRF: `python benchmarks/bench.py
   --full` on a GPU node. Expect ≥10× over the MPS numbers for the fits. If
   not, suspect the chunk planner (`starling/device.py: plan_chunks`) or
@@ -102,9 +119,30 @@ Notes:
   functionally with torch.stack, no slice writes, so compile can fuse).
   Add new lineshapes (pseudo-Voigt etc.) here + a public wrapper in
   `_curvefit.py`.
-- `starling/properties/_curvefit.py` — public fit API. Pattern for all fits:
-  centre/scale motor coords to O(1), normalise curves by max, fit in float32,
-  un-transform after. Required for MPS (no float64) — don't remove.
+- `starling/properties/_curvefit.py` — public fit API (`fit_1D_gaussian`,
+  `fit_1D_pseudo_voigt`, `fit_two_gaussians_1D`, `fit_2D_gaussian`,
+  `fit_ND_gaussian`). Pattern for all fits: centre/scale motor coords to O(1),
+  normalise curves by max, fit in float32, un-transform after. Required for MPS
+  (no float64) — don't remove. `fit_2D_gaussian` is now a thin wrapper around
+  `fit_ND_gaussian(D=2)` (parity asserted in `tests/test_fit_nd.py`); the N-D
+  model `gaussND_const` generalises the 2D Cholesky-of-precision parameterisation
+  to arbitrary D.
+- `starling/properties/_results.py` — named result dataclasses (`Gauss1DResult`,
+  `GaussNDResult`, `PseudoVoigtResult`, `MomentResult`); each has `.raw`,
+  `.fwhm`, `to_dict`/`to_h5`, and the N-D / moment ones delegate `.mosaicity()`
+  and `.orientation()`.
+- `starling/properties/_maps.py` — `orientation_map` (first moment, mean) and
+  `mosaicity` (second moment, spread). Kept distinct + documented; don't relabel
+  a COM map "mosaicity".
+- `starling/properties/_strain.py` — `strain_from_ccmth` / `strain_from_obpitch`
+  (darfix formulas).
+- `starling/transforms/_kam.py` — `kam` (kernel average misorientation, numpy).
+- `starling/viz.py` — `denoise_widget(dset)` interactive non-destructive preview
+  (ipywidgets, lazily imported).
+- `starling/io/_dataset.py` — `DataSet.analyze(method="auto", mask="auto")`
+  auto-dispatches by motor-dim count and returns a result object; convenience
+  `dset.mosaicity()/.orientation()/.strain()/.kam()`. Grain masking
+  (`preprocess.grain_mask` / `polygon_mask`) is threaded through moments + fits.
 - `starling/io/_metadata.py` — ID03 scan-command parsing + motor h5-path
   maps. **If a new beamline scan command appears, add it to `scan_arg_pos` /
   `is_integrated` here.** New motors go in `motor_map` (+ fallback).
@@ -113,9 +151,11 @@ Notes:
 - `starling/io/_partial.py` — aborted-scan loader.
 - `starling/batch/` — recipe schema, resumable runner, CLI.
 
-Output param-order gotcha (inherited from darling's code, whose docstring is
-wrong): `fit_1D_gaussian` returns `[A, sigma, mu, k, m, success]` — sigma at
-index 1, mu (peak centre) at index 2.
+Output param-order (verified, docstrings corrected): `fit_1D_gaussian` returns
+`[A, sigma, mu, k, m, success]` — sigma at index 1, mu (peak centre) at
+index 2. Prefer the named result objects (`dset.analyze()` →
+`Gauss1DResult.mu` / `.fwhm`) over column indices; `.raw` gives the legacy
+array for back-compat.
 
 ## Tests and how to trust a change
 
@@ -123,19 +163,15 @@ index 1, mu (peak centre) at index 2.
 .venv/bin/pytest tests/ -q
 ```
 
-- 24 tests run anywhere (synthetic parity vs darling if importable,
-  ground-truth recovery, recipe/IO round-trips, standalone-ness).
-- 4 golden tests auto-run when the LaCie is mounted at
+- Tests run anywhere: ground-truth recovery, recipe/IO round-trips,
+  standalone-ness.
+- 1 golden test auto-runs when the LaCie is mounted at
   `/Volumes/LaCie/ESRF_MA6278/RAW_DATA/...` (override with
   `STARLING_GOLDEN_H5` / `STARLING_GOLDEN_SCAN`).
-- `tests/test_standalone.py` enforces zero darling imports in the package.
+- `tests/test_standalone.py` enforces zero external DFXM package imports.
 
-**Pending verification:** `test_golden_vendored_loader_matches_darling`
-(byte-equality of the vendored BLISS loader vs darling on a real scan) was
-added after the drive dropped and has never executed. The port is
-line-for-line from the darling code that loaded MA6278 data successfully,
-but run it once when the drive is back. The LaCie unmounts itself
-intermittently — check `ls /Volumes/LaCie` before real-data work.
+The LaCie unmounts itself intermittently — check `ls /Volumes/LaCie` before
+real-data work.
 
 ## Data landscape on the LaCie (audited 2026-06-10)
 
@@ -166,5 +202,9 @@ intermittently — check `ls /Volumes/LaCie` before real-data work.
    numbers next to the MPS table above.
 3. During the experiment: notebook 01 per scan; keep recipes building in
    parallel so the post-experiment batch is one `starling run`.
-4. Deferred features when needed: NMF/PCA decomposition, pseudo-Voigt
-   lineshape, SLURM array submission, skew/kurtosis maps.
+4. Deferred features when needed: NMF/PCA decomposition, SLURM array
+   submission, absolute (crystallographic) strain via unit-cell/hkl, an N-D
+   two-peak mixture for overlapping sub-grains in 3D. (Done since the last
+   handoff: N-D Gaussian fit, orientation/mosaicity split, strain helpers, KAM,
+   skew/kurtosis maps, pseudo-Voigt, auto-dispatch + named results, interactive
+   denoise widget, grain masking.)

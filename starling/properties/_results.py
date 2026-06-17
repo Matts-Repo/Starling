@@ -1,0 +1,235 @@
+"""Named result objects for the analysis API.
+
+Bare ``(ny, nx, 6)`` arrays force callers to remember column indices
+(``params[..., 2]`` is the centre... or was it the width?). These dataclasses
+give every quantity a name while keeping a ``.raw`` array for back-compat with
+existing code and the golden tests.
+"""
+
+from dataclasses import dataclass, field
+from typing import Optional
+
+import numpy as np
+
+from ._maps import FWHM_FACTOR, mosaicity as _mosaicity, orientation_map as _orientation_map
+
+
+def _to_h5(path, kind, fields, attrs=None):
+    """Write a flat dict of arrays + a ``kind`` tag to an HDF5 file."""
+    import h5py
+
+    with h5py.File(path, "w") as f:
+        f.attrs["result_kind"] = kind
+        for k, v in (attrs or {}).items():
+            f.attrs[k] = v
+        for k, v in fields.items():
+            if v is None:
+                continue
+            arr = np.asarray(v)
+            if arr.ndim >= 2:
+                f.create_dataset(k, data=arr, compression="gzip", shuffle=True)
+            else:
+                f.create_dataset(k, data=arr)
+
+
+@dataclass
+class Gauss1DResult:
+    """Per-pixel 1-D Gaussian + linear-background fit.
+
+    Fields (each (ny, nx)): amplitude ``A``, ``sigma``, peak centre ``mu``,
+    background slope ``k``, background intercept ``m``, and ``success`` (1.0
+    where the fit converged).
+    """
+
+    A: np.ndarray
+    sigma: np.ndarray
+    mu: np.ndarray
+    k: np.ndarray
+    m: np.ndarray
+    success: np.ndarray
+
+    @property
+    def fwhm(self):
+        """Full width at half maximum, ``2.3548 * sigma``."""
+        return FWHM_FACTOR * self.sigma
+
+    @property
+    def raw(self):
+        """Legacy ``(ny, nx, 6)`` array ``[A, sigma, mu, k, m, success]``."""
+        return np.stack(
+            [self.A, self.sigma, self.mu, self.k, self.m, self.success], axis=-1
+        )
+
+    @classmethod
+    def from_raw(cls, arr):
+        """Build from the legacy ``(ny, nx, 6)`` array."""
+        arr = np.asarray(arr)
+        return cls(*(arr[..., i] for i in range(6)))
+
+    def to_dict(self):
+        return {
+            "A": self.A, "sigma": self.sigma, "mu": self.mu,
+            "k": self.k, "m": self.m, "success": self.success, "fwhm": self.fwhm,
+        }
+
+    def to_h5(self, path):
+        _to_h5(path, "gauss1d", self.to_dict())
+
+
+@dataclass
+class GaussNDResult:
+    """Per-pixel N-D Gaussian + constant-background fit.
+
+    Fields: amplitude ``A`` (ny, nx), centre ``mu`` (ny, nx, D), covariance
+    ``cov`` (ny, nx, D, D) in motor units, background ``c`` (ny, nx) and
+    ``success`` (ny, nx).
+    """
+
+    A: np.ndarray
+    mu: np.ndarray
+    cov: np.ndarray
+    c: np.ndarray
+    success: np.ndarray
+
+    @property
+    def D(self):
+        return self.mu.shape[-1]
+
+    @property
+    def fwhm(self):
+        """Per-axis FWHM, ``2.3548 * sqrt(diag(cov))`` -> (ny, nx, D)."""
+        diag = np.einsum("...ii->...i", self.cov)
+        return FWHM_FACTOR * np.sqrt(np.clip(diag, 0.0, None))
+
+    def mosaicity(self, mode="scalar", axes=None):
+        """Orientation spread from the fitted covariance (see properties.mosaicity)."""
+        return _mosaicity(self.cov, mode=mode, axes=axes)
+
+    def orientation(self, axes=(0, 1), norm="dynamic", as_rgb=False):
+        """Mean-orientation map from the fitted centre (see properties.orientation_map)."""
+        return _orientation_map(self.mu, axes=axes, norm=norm, as_rgb=as_rgb)
+
+    @property
+    def raw(self):
+        """Flat array ``[A, mu_0.., cov(upper-tri, row-major).., c, success]``.
+
+        For D=2 this is exactly the legacy ``fit_2D_gaussian`` layout
+        ``[A, mu0, mu1, cov00, cov01, cov11, c, success]``.
+        """
+        D = self.D
+        cols = [self.A]
+        for i in range(D):
+            cols.append(self.mu[..., i])
+        for r in range(D):
+            for s in range(r, D):
+                cols.append(self.cov[..., r, s])
+        cols += [self.c, self.success]
+        return np.stack(cols, axis=-1)
+
+    def to_dict(self):
+        return {
+            "A": self.A, "mu": self.mu, "cov": self.cov,
+            "c": self.c, "success": self.success,
+        }
+
+    def to_h5(self, path):
+        _to_h5(path, "gaussND", self.to_dict())
+
+
+@dataclass
+class PseudoVoigtResult:
+    """Per-pixel 1-D pseudo-Voigt + linear-background fit.
+
+    Fields (each (ny, nx)): ``A``, Gaussian width ``sigma``, centre ``mu``,
+    Lorentzian width ``gamma``, mixing ``eta`` in [0, 1] (1 = pure Lorentzian),
+    background ``k``, ``m`` and ``success``.
+    """
+
+    A: np.ndarray
+    sigma: np.ndarray
+    mu: np.ndarray
+    gamma: np.ndarray
+    eta: np.ndarray
+    k: np.ndarray
+    m: np.ndarray
+    success: np.ndarray
+
+    @property
+    def fwhm(self):
+        """Approximate pseudo-Voigt FWHM from the Gaussian and Lorentzian widths.
+
+        Uses the standard Thompson-Cox-Hastings width combination of the
+        component FWHMs (fG = 2.3548 sigma, fL = 2 gamma).
+        """
+        fg = FWHM_FACTOR * self.sigma
+        fl = 2.0 * self.gamma
+        return (
+            fg ** 5
+            + 2.69269 * fg ** 4 * fl
+            + 2.42843 * fg ** 3 * fl ** 2
+            + 4.47163 * fg ** 2 * fl ** 3
+            + 0.07842 * fg * fl ** 4
+            + fl ** 5
+        ) ** 0.2
+
+    @property
+    def raw(self):
+        """Legacy ``(ny, nx, 8)`` array ``[A, sigma, mu, gamma, eta, k, m, success]``."""
+        return np.stack(
+            [self.A, self.sigma, self.mu, self.gamma, self.eta,
+             self.k, self.m, self.success],
+            axis=-1,
+        )
+
+    @classmethod
+    def from_raw(cls, arr):
+        arr = np.asarray(arr)
+        return cls(*(arr[..., i] for i in range(8)))
+
+    def to_dict(self):
+        return {
+            "A": self.A, "sigma": self.sigma, "mu": self.mu, "gamma": self.gamma,
+            "eta": self.eta, "k": self.k, "m": self.m, "success": self.success,
+        }
+
+    def to_h5(self, path):
+        _to_h5(path, "pseudovoigt", self.to_dict())
+
+
+@dataclass
+class MomentResult:
+    """Per-pixel intensity-weighted moments.
+
+    ``mean`` (ny, nx[, D]) and ``covariance`` (ny, nx[, D, D]) are always
+    present; ``skew`` and ``kurtosis`` (per-axis, (ny, nx[, D])) are populated
+    only when computed with ``order=4``.
+    """
+
+    mean: np.ndarray
+    covariance: np.ndarray
+    skew: Optional[np.ndarray] = None
+    kurtosis: Optional[np.ndarray] = None
+
+    def mosaicity(self, mode="scalar", axes=None):
+        """Orientation spread from the moment covariance (see properties.mosaicity).
+
+        Raw second moments are biased low by the finite motor window and
+        residual background — prefer ``GaussNDResult.mosaicity`` for quantitative
+        work.
+        """
+        return _mosaicity(self.covariance, mode=mode, axes=axes)
+
+    def orientation(self, axes=(0, 1), norm="dynamic", as_rgb=False):
+        """Mean-orientation map from the first moment (see properties.orientation_map)."""
+        return _orientation_map(self.mean, axes=axes, norm=norm, as_rgb=as_rgb)
+
+    def to_dict(self):
+        out = {"mean": self.mean, "covariance": self.covariance}
+        if self.skew is not None:
+            out["skew"] = self.skew
+        if self.kurtosis is not None:
+            out["kurtosis"] = self.kurtosis
+        return out
+
+    def to_h5(self, path):
+        _to_h5(path, "moments", self.to_dict())

@@ -15,7 +15,8 @@ import torch
 from ..device import compute_dtype, get_device, plan_chunks
 from ._gaussnewton import gauss_newton_batched
 from ._init_guess import gaussian_seed, linear_trend
-from ._models import gauss1d_lin
+from ._models import gauss1d_lin, gaussND_const, pseudovoigt1d_lin
+from ._results import GaussNDResult, PseudoVoigtResult
 
 
 def fit_1D_gaussian(data, coordinates, n_iter_gauss_newton=7, mask=None, device=None):
@@ -72,7 +73,10 @@ def fit_1D_gaussian(data, coordinates, n_iter_gauss_newton=7, mask=None, device=
         if len(sel) < chunk and lo > 0:
             n_pad = chunk - len(sel)
             block = np.concatenate([block, np.repeat(block[:1], n_pad, axis=0)])
-        y = torch.as_tensor(np.ascontiguousarray(block), device=dev).to(dtype)
+        # cast to the compute dtype on the host *before* moving to the device:
+        # float64 cannot live on MPS, so as_tensor(..., device=mps) on a float64
+        # block would raise before the .to(dtype) downcast could run
+        y = torch.as_tensor(np.ascontiguousarray(block), dtype=dtype).to(dev)
         ys = y.amax(-1).clamp_min(1.0)
         yn = y / ys[:, None]
 
@@ -123,6 +127,106 @@ def fit_1D_gaussian(data, coordinates, n_iter_gauss_newton=7, mask=None, device=
         out[sel] = res_np[: len(sel)]
 
     return out.reshape(ny, nx, 6)
+
+
+def fit_1D_pseudo_voigt(data, coordinates, n_iter_gauss_newton=10, mask=None, device=None):
+    """Fit a pseudo-Voigt + linear background per pixel (batched on GPU).
+
+    f(x) = A [ (1 - eta) exp(-(x-mu)^2 / (2 sigma^2))
+               + eta / (1 + ((x-mu)/gamma)^2) ] + k x + m
+
+    For Lorentzian-tailed rocking curves a pure Gaussian biases the width; the
+    pseudo-Voigt mixes Gaussian and Lorentzian via ``eta`` in [0, 1] (0 = pure
+    Gaussian, 1 = pure Lorentzian). ``eta`` is box-constrained to [0, 1] by the
+    Gauss-Newton driver; ``gamma`` is seeded near ``sigma`` and ``eta`` at 0.5.
+
+    Args:
+        data (numpy.ndarray): shape (ny, nx, m).
+        coordinates: length-1 sequence holding the (m,) motor coordinate array.
+        n_iter_gauss_newton (int): Gauss-Newton iterations. Defaults to 10.
+        mask (numpy.ndarray): optional (ny, nx) bool; only True pixels are fit.
+        device: torch device or name; None auto-detects.
+
+    Returns:
+        PseudoVoigtResult: fields A, sigma, mu, gamma, eta, k, m, success
+        (each (ny, nx)).
+    """
+    if len(coordinates) != 1:
+        raise ValueError(
+            f"coordinates must be a 1d tuple but got {len(coordinates)} dimensions"
+        )
+    if data.ndim != 3:
+        raise ValueError(f"data must be a 3d numpy array but got {data.ndim} dimensions")
+
+    x = np.asarray(coordinates[0], dtype=np.float64)
+    ny, nx, N = data.shape
+    Y = data.reshape(ny * nx, N)
+    idx = np.flatnonzero(mask.ravel()) if mask is not None else np.arange(ny * nx)
+
+    dev = get_device(device)
+    dtype = compute_dtype(dev)
+    xc = float(x.mean())
+    xs = float(max(np.ptp(x) / 2.0, 1e-12))
+    xh = torch.as_tensor((x - xc) / xs, dtype=dtype, device=dev)
+
+    out = np.zeros((ny * nx, 8), dtype=np.float64)
+
+    p = 7
+    bytes_per_pixel = dtype.itemsize * N * (3 + p) * 2
+    chunk = plan_chunks(len(idx), bytes_per_pixel, dev)
+    # eta is bounded to [0, 1]; the other parameters are left free (+/- inf)
+    lo = torch.tensor(
+        [-torch.inf, -torch.inf, -torch.inf, -torch.inf, 0.0, -torch.inf, -torch.inf],
+        dtype=dtype, device=dev,
+    )
+    hi = torch.tensor(
+        [torch.inf, torch.inf, torch.inf, torch.inf, 1.0, torch.inf, torch.inf],
+        dtype=dtype, device=dev,
+    )
+    for lo_i in range(0, len(idx), chunk):
+        sel = idx[lo_i : lo_i + chunk]
+        block = Y[sel]
+        n_pad = 0
+        if len(sel) < chunk and lo_i > 0:
+            n_pad = chunk - len(sel)
+            block = np.concatenate([block, np.repeat(block[:1], n_pad, axis=0)])
+        # cast to the compute dtype on the host *before* moving to the device:
+        # float64 cannot live on MPS, so as_tensor(..., device=mps) on a float64
+        # block would raise before the .to(dtype) downcast could run
+        y = torch.as_tensor(np.ascontiguousarray(block), dtype=dtype).to(dev)
+        ys = y.amax(-1).clamp_min(1.0)
+        yn = y / ys[:, None]
+
+        k0, m0 = linear_trend(yn, xh)
+        A0, s0, mu0, degenerate = gaussian_seed(yn, xh, k0, m0)
+        s0 = torch.where(degenerate, torch.ones_like(s0), s0)
+        gamma0 = s0.clamp_min(1e-3)
+        eta0 = torch.full_like(A0, 0.5)
+        params0 = torch.stack([A0, s0, mu0, gamma0, eta0, k0, m0], dim=-1)
+
+        params, ok = gauss_newton_batched(
+            yn, xh, params0, pseudovoigt1d_lin,
+            n_iter=n_iter_gauss_newton, bounds=(lo, hi),
+        )
+        success = ok & ~degenerate
+
+        A, sigma, mu, gamma, eta, k, m = params.unbind(-1)
+        res = torch.stack(
+            [
+                A * ys,
+                sigma.abs() * xs,
+                xc + xs * mu,
+                gamma.abs() * xs,
+                eta.clamp(0.0, 1.0),
+                k * ys / xs,
+                (m - k * xc / xs) * ys,
+                success.to(params.dtype),
+            ],
+            dim=-1,
+        )
+        out[sel] = res.cpu().double().numpy()[: len(sel)]
+
+    return PseudoVoigtResult.from_raw(out.reshape(ny, nx, 8))
 
 
 def fit_two_gaussians_1D(
@@ -192,7 +296,10 @@ def fit_two_gaussians_1D(
             block = np.concatenate(
                 [block, np.repeat(block[:1], chunk - len(sel), axis=0)]
             )
-        y = torch.as_tensor(np.ascontiguousarray(block), device=dev).to(dtype)
+        # cast to the compute dtype on the host *before* moving to the device:
+        # float64 cannot live on MPS, so as_tensor(..., device=mps) on a float64
+        # block would raise before the .to(dtype) downcast could run
+        y = torch.as_tensor(np.ascontiguousarray(block), dtype=dtype).to(dev)
         ys = y.amax(-1).clamp_min(1.0)
         yn = y / ys[:, None]
 
@@ -308,12 +415,212 @@ def fit_two_gaussians_1D(
     }
 
 
+# per-dimension cached model closure: gaussND_const needs D as a Python
+# constant, and gauss_newton_batched caches its compiled step by the callable's
+# identity — so one stable closure per D compiles the step exactly once per
+# (D, device) instead of recompiling every chunk.
+_ND_MODEL_CACHE = {}
+
+
+def _nd_model(D):
+    if D not in _ND_MODEL_CACHE:
+        _ND_MODEL_CACHE[D] = lambda params, x: gaussND_const(params, x, D)
+    return _ND_MODEL_CACHE[D]
+
+
+def _safe_chol_lower(M):
+    """Batched lower Cholesky in numpy with clamped pivots (never raises).
+
+    M: (P, D, D) symmetric; returns L (P, D, D) lower-triangular with
+    ``L L^T ~= M``. Mirrors the MPS-safe unrolled solve in ``_solve``.
+    """
+    P, D, _ = M.shape
+    L = np.zeros_like(M)
+    for j in range(D):
+        s = M[:, j, j] - (L[:, j, :j] ** 2).sum(-1)
+        d = np.sqrt(np.clip(s, 1e-37, None))
+        L[:, j, j] = d
+        if j + 1 < D:
+            L[:, j + 1 :, j] = (
+                M[:, j + 1 :, j] - (L[:, j + 1 :, :j] * L[:, j : j + 1, :j]).sum(-1)
+            ) / d[:, None]
+    return L
+
+
+def _fit_ND_engine(data, coordinates, n_iter_gauss_newton, mask, device):
+    """Core N-D Gaussian + constant-background fit; returns a dict of maps.
+
+    Generalises the 2D mosa fit to arbitrary D. The inverse covariance is
+    Cholesky-parameterised during the fit (PSD by construction); the output
+    reports the covariance matrix in motor units.
+    """
+    coordinates = np.asarray(coordinates, dtype=np.float64)
+    D = coordinates.shape[0]
+    if data.ndim != D + 2:
+        raise ValueError(
+            f"data must be a {D + 2}d numpy array for {D} motor dimensions but "
+            f"got {data.ndim} dimensions"
+        )
+    if coordinates.shape != (D, *data.shape[2:]):
+        raise ValueError(
+            f"coordinates shape {coordinates.shape} does not match "
+            f"(D={D}, {data.shape[2:]})"
+        )
+
+    ny, nx = data.shape[:2]
+    N = int(np.prod(data.shape[2:]))
+    Y = data.reshape(ny * nx, N)
+    idx = np.flatnonzero(mask.ravel()) if mask is not None else np.arange(ny * nx)
+
+    dev = get_device(device)
+    dtype = compute_dtype(dev)
+
+    c_flat = coordinates.reshape(D, N)
+    xc = c_flat.mean(axis=1)  # (D,)
+    xs = np.maximum(np.ptp(c_flat, axis=1) / 2.0, 1e-12)  # (D,)
+    ch = torch.as_tensor((c_flat - xc[:, None]) / xs[:, None], dtype=dtype, device=dev)
+
+    model = _nd_model(D)
+    n_L = D * (D + 1) // 2
+    n_p = 1 + D + n_L + 1
+    tril = [(r, s) for r in range(D) for s in range(r + 1)]  # row-major lower-tri
+    eye = np.eye(D)
+
+    out_A = np.zeros(ny * nx)
+    out_mu = np.zeros((ny * nx, D))
+    out_cov = np.zeros((ny * nx, D, D))
+    out_c = np.zeros(ny * nx)
+    out_s = np.zeros(ny * nx)
+
+    bytes_per_pixel = dtype.itemsize * N * (3 + n_p) * 2
+    chunk = plan_chunks(len(idx), bytes_per_pixel, dev)
+    for lo in range(0, len(idx), chunk):
+        sel = idx[lo : lo + chunk]
+        block = Y[sel]
+        if len(sel) < chunk and lo > 0:
+            block = np.concatenate(
+                [block, np.repeat(block[:1], chunk - len(sel), axis=0)]
+            )
+        # cast to the compute dtype on the host *before* moving to the device:
+        # float64 cannot live on MPS, so as_tensor(..., device=mps) on a float64
+        # block would raise before the .to(dtype) downcast could run
+        y = torch.as_tensor(np.ascontiguousarray(block), dtype=dtype).to(dev)
+        ys = y.amax(-1).clamp_min(1.0)
+        yn = y / ys[:, None]
+
+        # --- seed from weighted moments of the background-subtracted signal ---
+        c0 = yn.amin(-1)
+        w = (yn - c0[:, None]).clamp_min(0.0)
+        I = w.sum(-1).clamp_min(1e-12)
+        mu = (w @ ch.T) / I[:, None]  # (P, D)
+        d = ch[None, :, :] - mu[:, :, None]  # (P, D, N)
+        cov = torch.einsum("pin,pjn->pij", d * w[:, None, :], d) / I[:, None, None]
+        diagcov = torch.einsum("...ii->...i", cov)
+        degenerate = (diagcov <= 1e-10).any(-1) | (I <= 1e-6)
+        A0 = (yn.amax(-1) - c0).clamp_min(1e-3)
+
+        # precision = inv(cov), L = chol(precision) — done in numpy (robust,
+        # MPS has no batched linalg) on degenerate-safe copies
+        cov_np = cov.detach().cpu().double().numpy()
+        deg_np = degenerate.cpu().numpy()
+        mu_np = mu.detach().cpu().double().numpy()
+        cov_safe = cov_np.copy()
+        cov_safe[deg_np] = eye
+        cov_safe = 0.5 * (cov_safe + np.swapaxes(cov_safe, -1, -2))
+        precision = np.linalg.inv(cov_safe)
+        precision = 0.5 * (precision + np.swapaxes(precision, -1, -2)) + 1e-9 * eye
+        L_seed = _safe_chol_lower(precision)
+        L_seed[deg_np] = eye
+        mu_np[deg_np] = 0.0
+
+        L_flat = np.stack([L_seed[:, r, s] for (r, s) in tril], axis=-1)  # (P, n_L)
+        seed = np.concatenate(
+            [
+                A0.detach().cpu().double().numpy()[:, None],
+                mu_np,
+                L_flat,
+                c0.detach().cpu().double().numpy()[:, None],
+            ],
+            axis=1,
+        )
+        p0 = torch.as_tensor(seed, dtype=dtype, device=dev)
+
+        params, ok = gauss_newton_batched(yn, ch, p0, model, n_iter=n_iter_gauss_newton)
+        ok = ok & ~degenerate
+
+        # --- un-transform back to motor units ---
+        params_np = params.detach().cpu().double().numpy()
+        ys_np = ys.detach().cpu().double().numpy()
+        A_f = params_np[:, 0] * ys_np
+        mu_f = xc[None, :] + xs[None, :] * params_np[:, 1 : 1 + D]
+        c_f = params_np[:, 1 + D + n_L] * ys_np
+
+        Lf = np.zeros((len(params_np), D, D))
+        for t, (r, s) in enumerate(tril):
+            Lf[:, r, s] = params_np[:, 1 + D + t]
+        precision_f = Lf @ np.swapaxes(Lf, -1, -2)  # L L^T (scaled coords)
+        det_f = np.linalg.det(precision_f)
+        bad = ~np.isfinite(det_f) | (np.abs(det_f) < 1e-300)
+        precision_f[bad] = eye
+        cov_f = np.linalg.inv(precision_f)
+        cov_f = cov_f * (xs[None, :, None] * xs[None, None, :])  # back to motor units
+
+        # zero the outputs of non-converged / degenerate pixels so no garbage
+        # (e.g. a window-mean mu or an inverted dummy covariance) leaks into the
+        # result maps or into mosaicity()/orientation(), which do not re-mask
+        ok_np = ok.detach().cpu().numpy()
+        A_f = np.where(ok_np, A_f, 0.0)
+        mu_f = np.where(ok_np[:, None], mu_f, 0.0)
+        cov_f = np.where(ok_np[:, None, None], cov_f, 0.0)
+        c_f = np.where(ok_np, c_f, 0.0)
+
+        keep = slice(0, len(sel))
+        out_A[sel] = A_f[keep]
+        out_mu[sel] = mu_f[keep]
+        out_cov[sel] = cov_f[keep]
+        out_c[sel] = c_f[keep]
+        out_s[sel] = ok_np[keep].astype(float)
+
+    return {
+        "A": out_A.reshape(ny, nx),
+        "mu": out_mu.reshape(ny, nx, D),
+        "cov": out_cov.reshape(ny, nx, D, D),
+        "c": out_c.reshape(ny, nx),
+        "success": out_s.reshape(ny, nx),
+    }
+
+
+def fit_ND_gaussian(data, coordinates, n_iter_gauss_newton=10, mask=None, device=None):
+    """Fit an N-D Gaussian + constant background per pixel (batched on GPU).
+
+    A single per-pixel Gaussian fit in an arbitrary number of motor dimensions
+    (D = 1, 2, 3, ...). The number of dimensions D is inferred from
+    ``coordinates``. A 3-D strain-mosa scan (e.g. chi x mu x 2theta) is fit
+    directly. The inverse covariance is Cholesky-parameterised during the fit
+    (positive (semi-)definite by construction, no bounds on L); the result
+    reports the covariance matrix in motor units.
+
+    Args:
+        data (numpy.ndarray): shape (ny, nx, *grid) with ``len(grid) == D``.
+        coordinates (numpy.ndarray): shape (D, *grid) motor meshgrids.
+        n_iter_gauss_newton (int): Gauss-Newton iterations. Defaults to 10.
+        mask (numpy.ndarray): optional (ny, nx) bool; only True pixels are fit.
+        device: torch device or name; None auto-detects.
+
+    Returns:
+        GaussNDResult: with fields A (ny, nx), mu (ny, nx, D),
+        cov (ny, nx, D, D), c (ny, nx), success (ny, nx).
+    """
+    maps = _fit_ND_engine(data, coordinates, n_iter_gauss_newton, mask, device)
+    return GaussNDResult(**maps)
+
+
 def fit_2D_gaussian(data, coordinates, n_iter_gauss_newton=10, mask=None, device=None):
     """Fit a 2D Gaussian + constant background per pixel over a mosa grid.
 
-    The inverse covariance is Cholesky-parameterised during the fit (positive
-    definite by construction); the output reports the covariance matrix in
-    motor units.
+    Thin wrapper around :func:`fit_ND_gaussian` (D=2) that returns the legacy
+    flat array for back-compat. The inverse covariance is Cholesky-parameterised
+    during the fit; the output reports the covariance matrix in motor units.
 
     Args:
         data (numpy.ndarray): shape (ny, nx, m, n).
@@ -326,97 +633,15 @@ def fit_2D_gaussian(data, coordinates, n_iter_gauss_newton=10, mask=None, device
         numpy.ndarray: (ny, nx, 8) float64,
         [A, mu0, mu1, cov00, cov01, cov11, c, success].
     """
-    from ._models import gauss2d_const
-
+    coordinates = np.asarray(coordinates, dtype=np.float64)
     if data.ndim != 4:
         raise ValueError(f"data must be a 4d numpy array but got {data.ndim} dimensions")
-    coordinates = np.asarray(coordinates, dtype=np.float64)
     if coordinates.shape != (2, *data.shape[2:]):
         raise ValueError(
-            f"coordinates shape {coordinates.shape} does not match (2, {data.shape[2]}, {data.shape[3]})"
+            f"coordinates shape {coordinates.shape} does not match "
+            f"(2, {data.shape[2]}, {data.shape[3]})"
         )
-
-    ny, nx = data.shape[:2]
-    N = data.shape[2] * data.shape[3]
-    Y = data.reshape(ny * nx, N)
-    idx = np.flatnonzero(mask.ravel()) if mask is not None else np.arange(ny * nx)
-
-    dev = get_device(device)
-    dtype = compute_dtype(dev)
-
-    c_flat = coordinates.reshape(2, N)
-    xc = c_flat.mean(axis=1)
-    xs = np.maximum(np.ptp(c_flat, axis=1) / 2.0, 1e-12)
-    ch = torch.as_tensor((c_flat - xc[:, None]) / xs[:, None], dtype=dtype, device=dev)
-
-    out = np.zeros((ny * nx, 8), dtype=np.float64)
-
-    bytes_per_pixel = dtype.itemsize * N * (3 + 7) * 2
-    chunk = plan_chunks(len(idx), bytes_per_pixel, dev)
-    for lo in range(0, len(idx), chunk):
-        sel = idx[lo : lo + chunk]
-        block = Y[sel]
-        if len(sel) < chunk and lo > 0:
-            block = np.concatenate(
-                [block, np.repeat(block[:1], chunk - len(sel), axis=0)]
-            )
-        y = torch.as_tensor(np.ascontiguousarray(block), device=dev).to(dtype)
-        ys = y.amax(-1).clamp_min(1.0)
-        yn = y / ys[:, None]
-
-        # seeds from weighted moments of the background-subtracted signal
-        c0 = yn.amin(-1)
-        w = (yn - c0[:, None]).clamp_min(0.0)
-        I = w.sum(-1).clamp_min(1e-12)
-        mu = (w @ ch.T) / I[:, None]  # (P, 2)
-        d0 = ch[0][None, :] - mu[:, 0:1]
-        d1 = ch[1][None, :] - mu[:, 1:2]
-        v00 = (w * d0 * d0).sum(-1) / I
-        v01 = (w * d0 * d1).sum(-1) / I
-        v11 = (w * d1 * d1).sum(-1) / I
-        det = (v00 * v11 - v01 * v01).clamp_min(1e-12)
-        degenerate = (v00 <= 1e-10) | (v11 <= 1e-10) | (I <= 1e-6)
-        # precision = inv(cov), then its Cholesky factor L (lower)
-        p00 = (v11 / det).clamp_min(1e-12)
-        p01 = -v01 / det
-        p11 = (v00 / det).clamp_min(1e-12)
-        L00 = torch.sqrt(p00)
-        L10 = p01 / L00
-        L11 = torch.sqrt((p11 - L10 * L10).clamp_min(1e-12))
-        A0 = (yn.amax(-1) - c0).clamp_min(1e-3)
-        L00 = torch.where(degenerate, torch.ones_like(L00), L00)
-        L10 = torch.where(degenerate, torch.zeros_like(L10), L10)
-        L11 = torch.where(degenerate, torch.ones_like(L11), L11)
-
-        p0 = torch.stack([A0, mu[:, 0], mu[:, 1], L00, L10, L11, c0], dim=-1)
-        params, ok = gauss_newton_batched(
-            yn, ch, p0, gauss2d_const, n_iter=n_iter_gauss_newton
-        )
-        ok = ok & ~degenerate
-
-        A_, m0_, m1_, l00, l10, l11, cc = params.unbind(-1)
-        # covariance from the fitted precision LL^T, back in motor units
-        q00 = l00 * l00
-        q01 = l00 * l10
-        q11 = l10 * l10 + l11 * l11
-        detq = (q00 * q11 - q01 * q01).clamp_min(1e-30)
-        cov00 = (q11 / detq) * xs[0] * xs[0]
-        cov01 = (-q01 / detq) * xs[0] * xs[1]
-        cov11 = (q00 / detq) * xs[1] * xs[1]
-
-        res = torch.stack(
-            [
-                A_ * ys,
-                xc[0] + xs[0] * m0_,
-                xc[1] + xs[1] * m1_,
-                cov00,
-                cov01,
-                cov11,
-                cc * ys,
-                (ok & ~degenerate).to(params.dtype),
-            ],
-            dim=-1,
-        )
-        out[sel] = res.cpu().double().numpy()[: len(sel)]
-
-    return out.reshape(ny, nx, 8)
+    return fit_ND_gaussian(
+        data, coordinates, n_iter_gauss_newton=n_iter_gauss_newton,
+        mask=mask, device=device,
+    ).raw

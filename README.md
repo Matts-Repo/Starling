@@ -29,6 +29,50 @@ out2 = dset.fit_two_gaussians_1D()          # 1 vs 2 peak per pixel, BIC-selecte
 p2d = dset.fit_2D_gaussian()                # 2D Gaussian over a mosa grid
 ```
 
+### Auto-dispatch + named results
+
+`dset.analyze()` picks the right analysis by **motor-dimension count**, so 1-D,
+2-D and 3-D scans all "just work" — no `if SCAN_TYPE` branching, no
+dimensionality error — and returns a named result object instead of a bare
+`(ny, nx, 6)` array:
+
+```python
+res = dset.analyze()        # 1 motor -> Gauss1DResult; >=2 motors -> GaussNDResult
+res.mu, res.fwhm            # named fields, not column indices
+res.raw                     # legacy array, for back-compat
+
+# 3-D strain-mosa (chi x mu x 2theta) is fit directly — no concatenation step:
+res3 = starling.properties.fit_ND_gaussian(cube, coords)   # GaussNDResult, D=3
+```
+
+### Orientation, mosaicity, strain, misorientation
+
+`orientation` and `mosaicity` are kept **separate and documented** (darling /
+darfix conflate them):
+
+```python
+ori  = dset.orientation(as_rgb=True)        # MEAN orientation (first moment)
+mos  = dset.mosaicity(mode="scalar")        # orientation SPREAD (second moment)
+eps  = dset.strain(motor="ccmth")           # strain map from a COM map
+kmap = dset.kam()                           # kernel average misorientation
+
+# pseudo-Voigt for Lorentzian-tailed rocking curves; higher moments:
+pv   = dset.fit_1D_pseudo_voigt()           # PseudoVoigtResult
+mean, cov, skew, kurt = dset.moments(order=4)
+```
+
+### Interactive noise-reduction preview
+
+```python
+%matplotlib widget
+starling.viz.denoise_widget(dset)           # tune bg/hot-pixel/ROI live, then Apply
+```
+
+The preview is non-destructive: `dset.data` is untouched until you press
+**Apply**. Restrict fitting to grain pixels with
+`mask = starling.preprocess.grain_mask(dset.data)` (or `polygon_mask` from a
+hand-drawn outline); `dset.analyze()` applies a grain mask automatically.
+
 ## Batch use (post-experiment)
 
 ```bash

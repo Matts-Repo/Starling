@@ -257,11 +257,29 @@ class DataSet:
     # analysis (GPU)
     # ------------------------------------------------------------------ #
 
-    def moments(self):
-        return properties.moments(self.data, self.motors, device=self.device)
+    @property
+    def n_motor_dims(self):
+        """Number of motor (scan) dimensions = ``data.ndim - 2``."""
+        if self.data is None:
+            raise ValueError("No data has been loaded, use load_scan() to load data.")
+        return self.data.ndim - 2
+
+    def moments(self, order=2, mask=None):
+        return properties.moments(
+            self.data, self.motors, order=order, mask=mask, device=self.device
+        )
 
     def fit_1D_gaussian(self, n_iter_gauss_newton=7, mask=None):
         return properties.fit_1D_gaussian(
+            self.data,
+            self.motors,
+            n_iter_gauss_newton=n_iter_gauss_newton,
+            mask=mask,
+            device=self.device,
+        )
+
+    def fit_1D_pseudo_voigt(self, n_iter_gauss_newton=10, mask=None):
+        return properties.fit_1D_pseudo_voigt(
             self.data,
             self.motors,
             n_iter_gauss_newton=n_iter_gauss_newton,
@@ -287,6 +305,159 @@ class DataSet:
             mask=mask,
             device=self.device,
         )
+
+    def fit_ND_gaussian(self, n_iter_gauss_newton=10, mask=None):
+        return properties.fit_ND_gaussian(
+            self.data,
+            self.motors,
+            n_iter_gauss_newton=n_iter_gauss_newton,
+            mask=mask,
+            device=self.device,
+        )
+
+    # ------------------------------------------------------------------ #
+    # auto-dispatch + convenience (Section 7)
+    # ------------------------------------------------------------------ #
+
+    def _resolve_mask(self, mask):
+        """Turn the ``mask`` argument into a bool array or None.
+
+        ``"auto"`` builds a grain mask from the z-sum (speeds up fitting by
+        skipping non-grain pixels); ``None`` fits every pixel; an array is used
+        verbatim.
+        """
+        if mask is None:
+            return None
+        if isinstance(mask, str) and mask == "auto":
+            return preprocess.grain_mask(self.data)
+        return np.asarray(mask, dtype=bool)
+
+    def analyze(self, method="auto", mask="auto", order=2, **opts):
+        """Run the appropriate analysis for this scan's dimensionality.
+
+        Dispatch is by **motor-dimension count**, so a 1-D, 2-D or 3-D scan all
+        "just work" with no ``if SCAN_TYPE`` branching and no dimensionality
+        error:
+
+        * ``method="auto"`` and 1 motor dim -> :class:`Gauss1DResult`.
+        * ``method="auto"`` and >= 2 motor dims -> :class:`GaussNDResult`
+          (the fitted N-D Gaussian; use its ``.mosaicity()`` / ``.orientation()``
+          for the spread / mean-orientation maps).
+
+        ``method`` can be forced to ``"moments"`` (-> :class:`MomentResult`),
+        ``"gauss1d"``, ``"gauss2p"`` (-> the two-peak dict), ``"gaussND"`` or
+        ``"pv"`` (-> :class:`PseudoVoigtResult`).
+
+        Args:
+            method (str): "auto" or a forced method name.
+            mask: "auto" (grain mask, default), None (all pixels) or a bool array.
+            order (int): moment order when moments are computed (2 or 4).
+            **opts: forwarded to the underlying fit (e.g. ``n_iter_gauss_newton``).
+
+        Returns:
+            The result object for the chosen method.
+        """
+        from ..properties import Gauss1DResult, MomentResult
+
+        m = self._resolve_mask(mask)
+        n = self.n_motor_dims
+        if method == "auto":
+            method = "gauss1d" if n == 1 else "gaussND"
+
+        if method == "moments":
+            res = self.moments(order=order, mask=m)
+            if order == 4:
+                mean, cov, skew, kurt = res
+                return MomentResult(mean, cov, skew, kurt)
+            mean, cov = res
+            return MomentResult(mean, cov)
+        if method == "gauss1d":
+            if n != 1:
+                raise ValueError(
+                    f"gauss1d needs 1 motor dim but this scan has {n}; use "
+                    f"method='gaussND' (or 'auto')."
+                )
+            return Gauss1DResult.from_raw(self.fit_1D_gaussian(mask=m, **opts))
+        if method == "gauss2p":
+            if n != 1:
+                raise ValueError(
+                    f"gauss2p needs 1 motor dim but this scan has {n}."
+                )
+            return self.fit_two_gaussians_1D(mask=m, **opts)
+        if method == "pv":
+            if n != 1:
+                raise ValueError(f"pv needs 1 motor dim but this scan has {n}.")
+            return self.fit_1D_pseudo_voigt(mask=m, **opts)
+        if method == "gaussND":
+            if n < 2:
+                raise ValueError(
+                    f"gaussND needs >= 2 motor dims but this scan has {n}; use "
+                    f"method='gauss1d' (or 'auto')."
+                )
+            return self.fit_ND_gaussian(mask=m, **opts)
+        raise ValueError(
+            f"unknown method {method!r}; expected 'auto', 'moments', 'gauss1d', "
+            f"'gauss2p', 'gaussND' or 'pv'"
+        )
+
+    def mosaicity(self, mode="scalar", axes=None, source="fit", mask="auto"):
+        """Orientation-spread (mosaicity) map; from the fit (default) or moments.
+
+        ``source="fit"`` uses the fitted covariance (less window/background bias,
+        recommended); ``source="moments"`` uses the raw second moment.
+        """
+        m = self._resolve_mask(mask)
+        if source == "fit" and self.n_motor_dims >= 2:
+            return self.fit_ND_gaussian(mask=m).mosaicity(mode=mode, axes=axes)
+        _, cov = self.moments(mask=m)
+        return properties.mosaicity(cov, mode=mode, axes=axes)
+
+    def orientation(self, axes=(0, 1), norm="dynamic", as_rgb=False, mask="auto"):
+        """Mean-orientation (centre-of-mass) map for the chosen motor axes."""
+        m = self._resolve_mask(mask)
+        mean, _ = self.moments(mask=m)
+        return properties.orientation_map(mean, axes=axes, norm=norm, as_rgb=as_rgb)
+
+    def strain(self, motor="ccmth", axis=None, reference=None, mask="auto"):
+        """Strain map from the orientation/COM along a motor axis.
+
+        ``motor`` selects the formula ("ccmth" or "obpitch"); ``axis`` selects
+        which motor dimension to read the COM from (auto-resolved from the scan
+        motor names when omitted, defaulting to axis 0 for a 1-motor scan).
+        """
+        m = self._resolve_mask(mask)
+        mean = self.moments(mask=m)[0]
+        if mean.ndim == 2:  # single motor
+            com = mean
+        else:
+            if axis is None:
+                axis = self._motor_axis(motor)
+            com = mean[..., axis]
+        if motor == "ccmth":
+            return properties.strain_from_ccmth(com, ccmth_0=reference)
+        if motor == "obpitch":
+            return properties.strain_from_obpitch(com, obpitch_0=reference)
+        raise ValueError(f"motor must be 'ccmth' or 'obpitch', got {motor!r}")
+
+    def _motor_axis(self, motor):
+        """Best-effort map from a motor name to its axis index (default 0)."""
+        try:
+            names = self.scan_params.get("motor_names") or []
+            for i, nm in enumerate(names):
+                if motor in str(nm):
+                    return i
+        except Exception:
+            pass
+        return 0
+
+    def kam(self, size=(3, 3), min_neighbors=1, axes=(0, 1), mask="auto"):
+        """Kernel average misorientation from the orientation (COM) field."""
+        from .. import transforms
+
+        m = self._resolve_mask(mask)
+        mean = self.moments(mask=m)[0]
+        com = mean if mean.ndim == 2 else mean[..., list(axes)]
+        return transforms.kam(com, size=size, min_neighbors=min_neighbors)
 
     def save_maps(self, path, maps, extra_attrs=None):
         from ._output import save_maps

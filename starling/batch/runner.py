@@ -121,6 +121,23 @@ def process_scan(entry, recipe, device):
             }
         else:
             print(f"  [note] gauss2d skipped: scan has {n_motor_dims} motor dims")
+    # gaussND fits any >=2-motor scan (2D, 3D, ...) via the N-D Gaussian; the
+    # auto-dispatch story means a 3D strain-mosa scan no longer needs a special
+    # fit entry — it just selects gaussND
+    if "gaussND" in recipe.fits:
+        if n_motor_dims >= 2:
+            maps["gaussND"] = {
+                "params": dset.fit_ND_gaussian(**(opts.get("gaussND") or {})).raw
+            }
+        else:
+            print(f"  [note] gaussND skipped: scan has {n_motor_dims} motor dims")
+    if "pv" in recipe.fits:
+        if n_motor_dims == 1:
+            maps["pv"] = {
+                "params": dset.fit_1D_pseudo_voigt(**(opts.get("pv") or {})).raw
+            }
+        else:
+            print(f"  [note] pv skipped: scan has {n_motor_dims} motor dims")
     if roi is not None:
         maps["roi"] = np.asarray(roi)
 

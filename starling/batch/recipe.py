@@ -7,7 +7,7 @@ from pathlib import Path
 
 import yaml
 
-VALID_FITS = ("moments", "gauss1d", "gauss2p", "gauss2d")
+VALID_FITS = ("moments", "gauss1d", "gauss2p", "gauss2d", "gaussND", "pv")
 
 
 @dataclass
