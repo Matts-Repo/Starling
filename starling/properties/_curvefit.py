@@ -448,7 +448,7 @@ def _safe_chol_lower(M):
 
 
 def _fit_ND_engine(data, coordinates, n_iter_gauss_newton, mask, device,
-                   lam=1e-2, adaptive=True):
+                   lam=1e-1, adaptive=True, progress=True):
     """Core N-D Gaussian + constant-background fit; returns a dict of maps.
 
     Generalises the 2D mosa fit to arbitrary D. The inverse covariance is
@@ -495,6 +495,13 @@ def _fit_ND_engine(data, coordinates, n_iter_gauss_newton, mask, device,
 
     bytes_per_pixel = dtype.itemsize * N * (3 + n_p) * 2
     chunk = plan_chunks(len(idx), bytes_per_pixel, dev)
+
+    from tqdm.auto import tqdm
+
+    pbar = tqdm(
+        total=len(idx), desc=f"fit {D}D gaussian", unit="px", unit_scale=True,
+        disable=not progress or len(idx) == 0, leave=True,
+    )
     for lo in range(0, len(idx), chunk):
         sel = idx[lo : lo + chunk]
         block = Y[sel]
@@ -583,7 +590,9 @@ def _fit_ND_engine(data, coordinates, n_iter_gauss_newton, mask, device,
         out_cov[sel] = cov_f[keep]
         out_c[sel] = c_f[keep]
         out_s[sel] = ok_np[keep].astype(float)
+        pbar.update(len(sel))
 
+    pbar.close()
     return {
         "A": out_A.reshape(ny, nx),
         "mu": out_mu.reshape(ny, nx, D),
@@ -594,7 +603,7 @@ def _fit_ND_engine(data, coordinates, n_iter_gauss_newton, mask, device,
 
 
 def fit_ND_gaussian(data, coordinates, n_iter_gauss_newton=10, mask=None, device=None,
-                    lam=1e-2, adaptive=True):
+                    lam=1e-1, adaptive=True, progress=True):
     """Fit an N-D Gaussian + constant background per pixel (batched on GPU).
 
     A single per-pixel Gaussian fit in an arbitrary number of motor dimensions
@@ -616,7 +625,8 @@ def fit_ND_gaussian(data, coordinates, n_iter_gauss_newton=10, mask=None, device
         cov (ny, nx, D, D), c (ny, nx), success (ny, nx).
     """
     maps = _fit_ND_engine(
-        data, coordinates, n_iter_gauss_newton, mask, device, lam=lam, adaptive=adaptive
+        data, coordinates, n_iter_gauss_newton, mask, device,
+        lam=lam, adaptive=adaptive, progress=progress,
     )
     return GaussNDResult(**maps)
 
