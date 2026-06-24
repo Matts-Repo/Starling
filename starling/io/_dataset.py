@@ -306,13 +306,15 @@ class DataSet:
             device=self.device,
         )
 
-    def fit_ND_gaussian(self, n_iter_gauss_newton=10, mask=None):
+    def fit_ND_gaussian(self, n_iter_gauss_newton=10, mask=None, lam=1e-2, adaptive=True):
         return properties.fit_ND_gaussian(
             self.data,
             self.motors,
             n_iter_gauss_newton=n_iter_gauss_newton,
             mask=mask,
             device=self.device,
+            lam=lam,
+            adaptive=adaptive,
         )
 
     # ------------------------------------------------------------------ #

@@ -447,7 +447,8 @@ def _safe_chol_lower(M):
     return L
 
 
-def _fit_ND_engine(data, coordinates, n_iter_gauss_newton, mask, device):
+def _fit_ND_engine(data, coordinates, n_iter_gauss_newton, mask, device,
+                   lam=1e-2, adaptive=True):
     """Core N-D Gaussian + constant-background fit; returns a dict of maps.
 
     Generalises the 2D mosa fit to arbitrary D. The inverse covariance is
@@ -545,7 +546,9 @@ def _fit_ND_engine(data, coordinates, n_iter_gauss_newton, mask, device):
         )
         p0 = torch.as_tensor(seed, dtype=dtype, device=dev)
 
-        params, ok = gauss_newton_batched(yn, ch, p0, model, n_iter=n_iter_gauss_newton)
+        params, ok = gauss_newton_batched(
+            yn, ch, p0, model, n_iter=n_iter_gauss_newton, lam=lam, adaptive=adaptive
+        )
         ok = ok & ~degenerate
 
         # --- un-transform back to motor units ---
@@ -590,7 +593,8 @@ def _fit_ND_engine(data, coordinates, n_iter_gauss_newton, mask, device):
     }
 
 
-def fit_ND_gaussian(data, coordinates, n_iter_gauss_newton=10, mask=None, device=None):
+def fit_ND_gaussian(data, coordinates, n_iter_gauss_newton=10, mask=None, device=None,
+                    lam=1e-2, adaptive=True):
     """Fit an N-D Gaussian + constant background per pixel (batched on GPU).
 
     A single per-pixel Gaussian fit in an arbitrary number of motor dimensions
@@ -611,7 +615,9 @@ def fit_ND_gaussian(data, coordinates, n_iter_gauss_newton=10, mask=None, device
         GaussNDResult: with fields A (ny, nx), mu (ny, nx, D),
         cov (ny, nx, D, D), c (ny, nx), success (ny, nx).
     """
-    maps = _fit_ND_engine(data, coordinates, n_iter_gauss_newton, mask, device)
+    maps = _fit_ND_engine(
+        data, coordinates, n_iter_gauss_newton, mask, device, lam=lam, adaptive=adaptive
+    )
     return GaussNDResult(**maps)
 
 
