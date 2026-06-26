@@ -113,3 +113,103 @@ def test_subtracted_hot_pixels_removed_non_destructive():
     out2 = preprocess.hot_pixels_removed(data, n_sigma=5.0)
     assert np.array_equal(data, before)
     assert out2 is not data
+
+
+# ------------- grain-safe background / hot-pixel / diagnostics -------------- #
+
+
+def _rocking_grain(ny=40, nx=44, nframes=20, amp=600, ped=20, seed=1):
+    """Grain whose pixels peak in a MINORITY of frames, on a flat pedestal.
+
+    Returns (uint16 data, footprint bool, true background-free integral / pixel).
+    """
+    rng = np.random.default_rng(seed)
+    yy, xx = np.mgrid[0:ny, 0:nx]
+    foot = (yy - ny // 2) ** 2 / 50.0 + (xx - nx // 2) ** 2 / 60.0 < 1
+    k = np.arange(nframes)
+    prof = np.exp(-0.5 * ((k - nframes // 2) / 2.0) ** 2)  # lit in ~7/20 frames
+    clean = np.zeros((ny, nx, nframes))
+    clean[foot] = amp * prof[None, :]
+    data = rng.poisson(ped + clean).astype(np.uint16)
+    return data, foot, clean.sum(-1)
+
+
+def test_estimate_background_modes_shape_dtype():
+    data, _, _ = _rocking_grain()
+    for mode in ("mean", "median", "lowest", "pmedian", "percentile"):
+        bg = preprocess.estimate_background(data, n_lowest=5, mode=mode, percentile=10)
+        assert bg.shape == data.shape[:2]
+        assert bg.dtype == data.dtype
+
+
+def test_estimate_background_rounds_not_floors():
+    # mean of (10, 11, 11) = 10.67 must ROUND to 11, not floor to 10 (NUM-01)
+    d = np.empty((1, 1, 3), np.uint16)
+    d[..., 0], d[..., 1], d[..., 2] = 10, 11, 11
+    assert preprocess.estimate_background(d, n_lowest=3, mode="mean")[0, 0] == 11
+
+
+def test_estimate_background_darks_overrides_mode():
+    data, _, _ = _rocking_grain()
+    darks = np.full((data.shape[0], data.shape[1], 4), 7, np.uint16)
+    assert np.all(preprocess.estimate_background(data, darks=darks) == 7)
+    img = np.full(data.shape[:2], 9, np.uint16)
+    assert np.all(preprocess.estimate_background(data, darks=img) == 9)
+
+
+def test_estimate_background_percentile_chunking_invariant():
+    data, _, _ = _rocking_grain()
+    a = preprocess.estimate_background(data, mode="percentile", percentile=10, chunk_rows=3)
+    b = preprocess.estimate_background(data, mode="percentile", percentile=10, chunk_rows=10_000)
+    assert np.array_equal(a, b)
+
+
+def test_grain_signal_retained_flags_inflated_background():
+    data, foot, _ = _rocking_grain()
+    before = data.copy()
+    bg_ok = preprocess.estimate_background(data, n_lowest=5, mode="lowest")
+    d_ok = preprocess.grain_signal_retained(data, bg_ok, mask=foot)
+    assert d_ok["retained"] > 0.9          # darkest-frames bg ~ as good as the floor
+    bg_hi = np.full(data.shape[:2], 200, np.uint16)
+    d_hi = preprocess.grain_signal_retained(data, bg_hi, mask=foot)
+    assert d_hi["retained"] < 0.9          # an inflated bg eats grain vs the floor
+    assert np.array_equal(data, before)    # non-destructive
+
+
+def test_signed_zsum_clean_baseline_and_nondestructive():
+    data, foot, true_int = _rocking_grain()
+    before = data.copy()
+    bg = preprocess.estimate_background(data, n_lowest=5, mode="lowest")
+    sz = preprocess.signed_zsum(data, bg)
+    assert np.array_equal(data, before)
+    off = ~preprocess.grain_mask(data)
+    assert abs(np.median(sz[off])) < 5            # noise cancels -> ~0 off-grain
+    assert sz[foot].sum() > 0.8 * true_int[foot].sum()  # recovers most grain signal
+
+
+def test_remove_hot_pixels_one_sided_preserves_interior_dark_feature():
+    frame = np.full((1, 30, 30), 500, np.uint16)
+    frame[0, 15, 15] = 50                          # genuine sharp dark void
+    two = frame.copy(); preprocess.remove_hot_pixels(two, n_sigma=5)
+    one = frame.copy(); preprocess.remove_hot_pixels(one, n_sigma=5, one_sided=True)
+    assert two[0, 15, 15] > 100                    # two-sided FILLS the void (HP-02)
+    assert one[0, 15, 15] == 50                    # one-sided leaves it intact
+
+
+def test_remove_hot_pixels_min_sigma_prevents_floored_frame_flagging():
+    # mostly-zero (floored) frame; one interior pixel 3 cts above its neighbours.
+    frame = np.zeros((1, 30, 30), np.uint16)
+    frame[0, 12:18, 12:18] = 100
+    frame[0, 15, 15] = 103
+    legacy = frame.copy(); preprocess.remove_hot_pixels(legacy, n_sigma=5)
+    safe = frame.copy(); preprocess.remove_hot_pixels(safe, n_sigma=5, min_sigma=1.0)
+    assert legacy[0, 15, 15] == 100   # collapsed MAD flags a 3-ct grain-texture pixel
+    assert safe[0, 15, 15] == 103     # min_sigma floor leaves it (HP-01 fix)
+
+
+def test_remove_hot_pixels_still_kills_real_zinger_on_grain():
+    data, foot, _ = _rocking_grain()
+    gi = np.argwhere(foot)[0]
+    data[gi[0], gi[1], data.shape[2] // 2] = 60000   # zinger on a grain pixel
+    preprocess.remove_hot_pixels(data, n_sigma=5, one_sided=True, min_sigma=1.0)
+    assert data[gi[0], gi[1], data.shape[2] // 2] < 5000  # removed despite being on-grain

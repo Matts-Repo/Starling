@@ -221,19 +221,28 @@ def roi_picker(h5_path, scan_ids, n_preview_frames=20, pixel_size_mm=6.5e-3):
     return panel
 
 
-def denoise_widget(dset, bg_n=5, bg_mode="mean", hot_sigma=5.0, roi_threshold=0.05):
+def denoise_widget(dset, bg_n=5, bg_mode="mean", bg_percentile=10.0, hot_sigma=5.0,
+                   roi_threshold=0.05, hot_one_sided=True, hot_min_sigma=1.0):
     """Interactive denoise preview for a DataSet (JupyterLab, %matplotlib widget).
 
-    Sliders/inputs control the background frame count and mode, the hot-pixel
-    sigma and the ROI threshold. Every change recomputes a cheap preview and
-    redraws the before/after z-sum, a representative frame and a signal
-    histogram, with the proposed ROI box overlaid. The dataset is **not**
+    Sliders/inputs control the background estimator, the hot-pixel sigma and the
+    ROI threshold. Every change recomputes a cheap preview and redraws the
+    before/after z-sum, the **counts removed inside the grain** (so you can see
+    directly whether the background is eating grain signal), a representative
+    frame and a signal histogram, with the proposed ROI box overlaid and the
+    in-grain *signal-retained %* in the figure title. The dataset is **not**
     modified until *Apply* is pressed; re-opening the widget always previews from
-    the original data.
+    the original data. *Apply* uses the grain-safe hot-pixel filter (one-sided +
+    robust-sigma floor) so genuine grain pixels are not flagged and interior dark
+    features are never filled, while real zingers (even on the grain) are removed.
 
     Args:
         dset: a ``starling.DataSet`` (uses ``dset.data``).
-        bg_n, bg_mode, hot_sigma, roi_threshold: initial control values.
+        bg_n, bg_mode, bg_percentile, hot_sigma, roi_threshold: initial values.
+            ``bg_mode`` is one of "mean"/"median"/"lowest"/"pmedian"/"percentile".
+        hot_one_sided, hot_min_sigma: grain-safe hot-pixel settings applied on
+            *Apply* (one-sided so dark features are never filled; ``min_sigma``
+            floors the robust sigma so mostly-zero frames cannot flag grain pixels).
 
     Returns:
         The ipywidgets container (also displayed in a notebook).
@@ -249,18 +258,24 @@ def denoise_widget(dset, bg_n=5, bg_mode="mean", hot_sigma=5.0, roi_threshold=0.
     raw = dset._raw_data
 
     bg_n_w = widgets.IntSlider(value=bg_n, min=1, max=30, description="bg n")
-    bg_mode_w = widgets.Dropdown(options=["mean", "median"], value=bg_mode, description="bg mode")
+    bg_mode_w = widgets.Dropdown(
+        options=["mean", "median", "lowest", "pmedian", "percentile"],
+        value=bg_mode, description="bg mode",
+    )
+    pct_w = widgets.FloatSlider(value=bg_percentile, min=1.0, max=50.0, step=1.0,
+                                description="pctile")
     hot_w = widgets.FloatSlider(value=hot_sigma, min=2.0, max=15.0, step=0.5, description="hot σ")
     roi_w = widgets.FloatSlider(value=roi_threshold, min=0.0, max=0.5, step=0.01, description="roi thr")
     apply_btn = widgets.Button(description="Apply", button_style="success")
     status = widgets.Output()
 
-    fig, axes = plt.subplots(1, 4, figsize=(15, 3.2))
+    fig, axes = plt.subplots(1, 5, figsize=(18, 3.2))
 
     def render(*_):
         pv = preprocess.preview(
             raw, bg_n=bg_n_w.value, bg_mode=bg_mode_w.value,
-            hot_sigma=hot_w.value, roi_threshold=roi_w.value,
+            bg_percentile=pct_w.value, hot_sigma=hot_w.value,
+            roi_threshold=roi_w.value,
         )
         for ax in axes:
             ax.clear()
@@ -271,35 +286,58 @@ def denoise_widget(dset, bg_n=5, bg_mode="mean", hot_sigma=5.0, roi_threshold=0.
         r1, r2, c1, c2 = pv["roi"]
         axes[1].add_patch(Rectangle((c1, r1), c2 - c1, r2 - r1,
                                     ec="cyan", fc="none", lw=1.5))
-        axes[2].imshow(np.log1p(pv["proc_frame"]), cmap="hot", origin="lower")
-        axes[2].set_title("brightest frame (denoised)")
+        # counts removed inside the grain — should be ~0 within the grain core
+        removed_in = np.where(pv["grain"], pv["removed_zsum"], np.nan)
+        im = axes[2].imshow(removed_in, cmap="magma", origin="lower")
+        axes[2].set_title("removed inside grain")
+        fig.colorbar(im, ax=axes[2], fraction=0.046)
+        axes[3].imshow(np.log1p(pv["proc_frame"]), cmap="hot", origin="lower")
+        axes[3].set_title("brightest frame (denoised)")
         counts, edges = pv["hist"]
-        axes[3].plot(0.5 * (edges[:-1] + edges[1:]), counts, lw=1.2)
-        axes[3].set_yscale("log")
-        axes[3].set_title("signal histogram")
+        axes[4].plot(0.5 * (edges[:-1] + edges[1:]), counts, lw=1.2)
+        axes[4].set_yscale("log")
+        axes[4].set_title("signal histogram")
+        ret = pv["retained"]
+        warn = "  ⚠ background may be eating grain" if ret == ret and ret < 0.90 else ""
+        fig.suptitle(f"in-grain signal retained: {100 * ret:.1f}%{warn}", fontsize=11)
         fig.canvas.draw_idle()
 
     def on_apply(_):
         with status:
             status.clear_output()
-            bg = preprocess.estimate_background(raw, n_lowest=bg_n_w.value, mode=bg_mode_w.value)
+            bg = preprocess.estimate_background(
+                raw, n_lowest=bg_n_w.value, mode=bg_mode_w.value,
+                percentile=pct_w.value,
+            )
+            diag = preprocess.grain_signal_retained(raw, bg)
             data = preprocess.subtracted(raw, bg)
-            preprocess.remove_hot_pixels(data, n_sigma=hot_w.value)
+            # grain-safe hot pixels: one-sided (never fills dark features) +
+            # robust-sigma floor (mostly-zero frames can't flag grain pixels)
+            preprocess.remove_hot_pixels(
+                data, n_sigma=hot_w.value, one_sided=hot_one_sided,
+                min_sigma=hot_min_sigma,
+            )
             roi = preprocess.auto_roi(data, threshold_rel=roi_w.value)
             r1, r2, c1, c2 = roi
             dset.data = np.ascontiguousarray(data[r1:r2, c1:c2])
             dset.roi = roi
             print(
-                f"Applied: bg(n={bg_n_w.value}, {bg_mode_w.value}), "
-                f"hot σ={hot_w.value}, roi={roi} -> data {dset.data.shape}"
+                f"Applied: bg(n={bg_n_w.value}, {bg_mode_w.value}"
+                f"{f', pct={pct_w.value:.0f}' if bg_mode_w.value == 'percentile' else ''}), "
+                f"hot σ={hot_w.value} (one-sided, σ-floored), roi={roi} "
+                f"-> data {dset.data.shape}"
+            )
+            print(
+                f"In-grain signal retained: {100 * diag['retained']:.1f}%  "
+                f"({diag['grain_px']:,} grain px, {diag['floored_px']:,} floored to 0)"
             )
 
-    for w in (bg_n_w, bg_mode_w, hot_w, roi_w):
+    for w in (bg_n_w, bg_mode_w, pct_w, hot_w, roi_w):
         w.observe(render, names="value")
     apply_btn.on_click(on_apply)
     render()
 
-    controls = widgets.HBox([bg_n_w, bg_mode_w, hot_w, roi_w, apply_btn])
+    controls = widgets.HBox([bg_n_w, bg_mode_w, pct_w, hot_w, roi_w, apply_btn])
     box = widgets.VBox([controls, status])
     display(box)
     return box

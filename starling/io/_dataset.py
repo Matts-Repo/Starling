@@ -236,14 +236,31 @@ class DataSet:
     # preprocessing
     # ------------------------------------------------------------------ #
 
-    def estimate_background(self, n_lowest=5, mode="mean"):
-        return preprocess.estimate_background(self.data, n_lowest=n_lowest, mode=mode)
+    def estimate_background(
+        self, n_lowest=5, mode="mean", percentile=10.0, darks=None, chunk_rows=None
+    ):
+        return preprocess.estimate_background(
+            self.data,
+            n_lowest=n_lowest,
+            mode=mode,
+            percentile=percentile,
+            darks=darks,
+            chunk_rows=chunk_rows,
+        )
 
     def subtract(self, background):
         preprocess.subtract(self.data, background)
 
-    def remove_hot_pixels(self, n_sigma=5.0):
-        preprocess.remove_hot_pixels(self.data, n_sigma=n_sigma)
+    def remove_hot_pixels(
+        self, n_sigma=5.0, one_sided=False, protect=None, min_sigma=None
+    ):
+        preprocess.remove_hot_pixels(
+            self.data,
+            n_sigma=n_sigma,
+            one_sided=one_sided,
+            protect=protect,
+            min_sigma=min_sigma,
+        )
 
     def auto_roi(self, threshold_rel=0.05, pad=20, apply=True):
         """Find (and by default crop to) the grain bounding box."""
