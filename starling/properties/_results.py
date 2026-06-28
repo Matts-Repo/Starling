@@ -66,6 +66,14 @@ class Gauss1DResult:
         arr = np.asarray(arr)
         return cls(*(arr[..., i] for i in range(6)))
 
+    @classmethod
+    def from_dict(cls, d):
+        """Rebuild from a field dict (the ``fwhm`` property, if present, is ignored)."""
+        return cls(
+            A=np.asarray(d["A"]), sigma=np.asarray(d["sigma"]), mu=np.asarray(d["mu"]),
+            k=np.asarray(d["k"]), m=np.asarray(d["m"]), success=np.asarray(d["success"]),
+        )
+
     def to_dict(self):
         return {
             "A": self.A, "sigma": self.sigma, "mu": self.mu,
@@ -125,6 +133,14 @@ class GaussNDResult:
                 cols.append(self.cov[..., r, s])
         cols += [self.c, self.success]
         return np.stack(cols, axis=-1)
+
+    @classmethod
+    def from_dict(cls, d):
+        """Rebuild from a field dict (``A``, ``mu``, ``cov``, ``c``, ``success``)."""
+        return cls(
+            A=np.asarray(d["A"]), mu=np.asarray(d["mu"]), cov=np.asarray(d["cov"]),
+            c=np.asarray(d["c"]), success=np.asarray(d["success"]),
+        )
 
     def to_dict(self):
         return {
@@ -186,6 +202,15 @@ class PseudoVoigtResult:
         arr = np.asarray(arr)
         return cls(*(arr[..., i] for i in range(8)))
 
+    @classmethod
+    def from_dict(cls, d):
+        """Rebuild from a field dict (the ``fwhm`` property, if present, is ignored)."""
+        return cls(
+            A=np.asarray(d["A"]), sigma=np.asarray(d["sigma"]), mu=np.asarray(d["mu"]),
+            gamma=np.asarray(d["gamma"]), eta=np.asarray(d["eta"]),
+            k=np.asarray(d["k"]), m=np.asarray(d["m"]), success=np.asarray(d["success"]),
+        )
+
     def to_dict(self):
         return {
             "A": self.A, "sigma": self.sigma, "mu": self.mu, "gamma": self.gamma,
@@ -222,6 +247,17 @@ class MomentResult:
     def orientation(self, axes=(0, 1), norm="dynamic", as_rgb=False):
         """Mean-orientation map from the first moment (see properties.orientation_map)."""
         return _orientation_map(self.mean, axes=axes, norm=norm, as_rgb=as_rgb)
+
+    @classmethod
+    def from_dict(cls, d):
+        """Rebuild from a field dict; ``skew``/``kurtosis`` default to ``None``."""
+        skew = d.get("skew")
+        kurt = d.get("kurtosis")
+        return cls(
+            mean=np.asarray(d["mean"]), covariance=np.asarray(d["covariance"]),
+            skew=None if skew is None else np.asarray(skew),
+            kurtosis=None if kurt is None else np.asarray(kurt),
+        )
 
     def to_dict(self):
         out = {"mean": self.mean, "covariance": self.covariance}

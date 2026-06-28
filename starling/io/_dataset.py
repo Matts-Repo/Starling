@@ -484,3 +484,30 @@ class DataSet:
         from ._output import save_maps
 
         save_maps(path, maps, scan_params=self.scan_params, extra_attrs=extra_attrs)
+
+    def save_nexus(self, path, result, *, motors=None, scan_params=None, **kw):
+        """Write a result object to a standards-compliant NeXus file.
+
+        Pulls ``self.motors`` / ``self.scan_params`` (the latter is ``None`` when
+        no scan has been loaded) unless overridden. See
+        :func:`starling.io.save_nexus`.
+        """
+        from ._nexus import save_nexus
+
+        if motors is None:
+            motors = self.motors
+        if scan_params is None:
+            try:
+                scan_params = self.scan_params
+            except Exception:
+                scan_params = None
+        return save_nexus(path, result, motors=motors, scan_params=scan_params, **kw)
+
+    def save_dataset_nexus(self, path, **kw):
+        """Persist this dataset's denoised cube + motors + provenance as NeXus.
+
+        See :func:`starling.io.save_dataset_nexus`.
+        """
+        from ._nexus import save_dataset_nexus
+
+        return save_dataset_nexus(path, self, **kw)
