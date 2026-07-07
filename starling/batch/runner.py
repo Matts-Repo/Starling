@@ -7,7 +7,7 @@ from pathlib import Path
 import h5py
 import numpy as np
 
-from .. import DataSet
+from .. import DataSet, preprocess
 from ..io._output import save_maps
 
 
@@ -83,7 +83,25 @@ def process_scan(entry, recipe, device):
         )
         dset.subtract(bg)
     if pp.get("hot_pixels", {}).get("enabled", False):
-        dset.remove_hot_pixels(n_sigma=pp["hot_pixels"].get("n_sigma", 5.0))
+        hp = pp["hot_pixels"]
+        # Grain-safe defaults (one_sided=True, min_sigma=1.0), matching
+        # notebooks/03 and viz.denoise_widget — batch and notebook now give
+        # identical results. BEHAVIOUR CHANGE vs older runners, which used the
+        # legacy two-sided/unfloored settings; restore those explicitly with
+        # `hot_pixels: {one_sided: false, min_sigma: null}` in the recipe.
+        protect = None
+        if hp.get("protect") == "grain":
+            protect = preprocess.grain_mask(dset.data)
+        preprocess.remove_hot_pixels(
+            dset.data,
+            n_sigma=hp.get("n_sigma", 5.0),
+            one_sided=hp.get("one_sided", True),
+            min_sigma=hp.get("min_sigma", 1.0),
+            protect=protect,
+            method=hp.get("method", "frame"),
+            backend=hp.get("backend"),
+            device=device,
+        )
     roi_cfg = pp.get("roi")
     roi = None
     if roi_cfg == "auto":

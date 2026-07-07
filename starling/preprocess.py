@@ -1,9 +1,11 @@
 """Preprocessing: background estimation/subtraction, auto-ROI, hot pixels.
 
 Background subtraction clamps to the background image before subtracting so
-uint16 never wraps. These operations are memory-bandwidth bound, so they run
-in numpy on the host where the data already lives; the GPU is reserved for
-the fitting.
+uint16 never wraps. The reductions (background, z-sums, ROI) are
+memory-bandwidth bound, so they run in numpy on the host where the data
+already lives. Hot-pixel removal is compute-bound (a 3x3 median per pixel per
+frame) and runs batched on the torch device by default (cuda > mps > cpu);
+a scipy reference path is kept behind ``backend="scipy"``.
 """
 
 import numpy as np
@@ -299,11 +301,196 @@ def auto_roi(data, threshold_rel=0.05, pad=20):
     )
 
 
-def remove_hot_pixels(data, n_sigma=5.0, one_sided=False, protect=None, min_sigma=None):
-    """Replace hot pixels with the 3x3 spatial median, frame by frame.
+# The 19-comparator median-of-9 sorting network (Paeth). Each pair (i, j)
+# leaves min at i and max at j; after all passes index 4 holds the median.
+_MEDIAN9_NET = (
+    (1, 2), (4, 5), (7, 8), (0, 1), (3, 4), (6, 7), (1, 2), (4, 5), (7, 8),
+    (0, 3), (5, 8), (4, 7), (3, 6), (1, 4), (2, 5), (4, 7), (4, 2), (6, 4),
+    (4, 2),
+)
+
+
+def _median9(planes):
+    """Median of 9 same-shape tensors via an explicit min/max sorting network.
+
+    WHY a network and not ``torch.median``/``torch.sort`` over a dim:
+    on MPS (torch 2.12) both are **silently wrong** for many-lane small sorts
+    — sorting 9 elements per lane over ~4M pixel lanes returns wrong values in
+    ~90% of lanes with no error raised (reproduced synthetically; see
+    starling-review 07_baseline_benchmarks.md). Elementwise
+    ``torch.minimum``/``torch.maximum`` are correct on every backend, so the
+    network is used unconditionally — including on CUDA, where behaviour at
+    these odd shapes is unverified — because it is portable, deterministic,
+    and at 19 fused elementwise ops also faster than a general sort.
+    """
+    import torch
+
+    p = list(planes)
+    for i, j in _MEDIAN9_NET:
+        lo = torch.minimum(p[i], p[j])
+        p[j] = torch.maximum(p[i], p[j])
+        p[i] = lo
+    return p[4]
+
+
+def _remove_hot_frames_scipy(frames, n_sigma, one_sided, keep, floor):
+    """Reference implementation: serial per-frame scipy median filter (host)."""
+    from scipy.ndimage import median_filter
+
+    for k in range(frames.shape[-1]):
+        frame = frames[:, :, k]
+        med = median_filter(frame, size=3)
+        diff = frame.astype(np.float64) - med
+        mad = np.median(np.abs(diff))
+        sigma = max(1.4826 * mad, floor)
+        hot = diff > n_sigma * sigma if one_sided else np.abs(diff) > n_sigma * sigma
+        if keep is not None:
+            hot &= ~keep
+        frame[hot] = med[hot]
+
+
+def _remove_hot_frames_torch(frames, n_sigma, one_sided, keep, floor, device=None,
+                             chunk_frames=None):
+    """Batched hot-pixel replacement on a torch device. In-place on ``frames``.
+
+    Per chunk of frames: 3x3 median via 9 shifted views of a replicate-padded
+    stack + the min/max sorting network, per-frame robust sigma from the MAD of
+    the residual, threshold, protect, and in-place replacement on the host
+    array. Pixel-identical to the scipy path (validated on real 2048^2 data).
+    """
+    import torch
+    import torch.nn.functional as F
+
+    from .device import compute_dtype, get_device, plan_chunks
+
+    dev = get_device(device)
+    cdt = compute_dtype(dev)  # float32 on cuda/mps (no float64 on MPS), float64 on cpu
+    np_cdt = np.float32 if cdt == torch.float32 else np.float64
+    a, b, nf = frames.shape
+    if chunk_frames is None:
+        # peak working set per frame: padded copy, the 9 network planes plus
+        # temporaries, |diff|, sort values+indices, masks -> ~20 frame buffers
+        per_frame = a * b * np.dtype(np_cdt).itemsize * 20
+        chunk_frames = plan_chunks(nf, per_frame, dev)
+    # cap the chunk so the per-frame MAD sort below keeps a modest lane count
+    # (the broken MPS regime is millions of lanes; production chunks are ~50)
+    chunk_frames = max(1, min(int(chunk_frames), nf, 256))
+    keep_t = None
+    if keep is not None:
+        keep_t = torch.from_numpy(np.ascontiguousarray(keep)).to(dev)
+    out_dtype = frames.dtype
+    for k0 in range(0, nf, chunk_frames):
+        k1 = min(k0 + chunk_frames, nf)
+        # gather the strided detector-first slab into contiguous (k, a, b)
+        blk = frames[:, :, k0:k1].transpose(2, 0, 1).astype(np_cdt, order="C")
+        x = torch.from_numpy(blk).to(dev)
+        # scipy median_filter(size=3, mode="reflect") duplicates the edge
+        # sample for a width-1 border == torch "replicate" (torch "reflect"
+        # would differ on every border row/col)
+        xp = F.pad(x.unsqueeze(1), (1, 1, 1, 1), mode="replicate").squeeze(1)
+        med = _median9([xp[:, i:i + a, j:j + b] for i in range(3) for j in range(3)])
+        diff = x - med
+        # per-frame robust sigma: MAD = median(|diff|) over the whole frame.
+        # torch.sort along ONE LARGE dim (few frame-lanes x a*b elements) is
+        # the orientation validated correct on MPS — it is the many-lane
+        # small-dim case that is silently wrong there (see _median9). This
+        # exact formulation was verified pixel-identical to np.median/scipy.
+        flat = diff.abs().reshape(diff.shape[0], -1)
+        n = flat.shape[1]
+        srt = torch.sort(flat, dim=1).values
+        if n % 2:
+            mad = srt[:, n // 2]
+        else:
+            mad = 0.5 * (srt[:, n // 2 - 1] + srt[:, n // 2])
+        sigma = torch.clamp(1.4826 * mad, min=floor)
+        thr = (n_sigma * sigma).view(-1, 1, 1)
+        hot = diff > thr if one_sided else diff.abs() > thr
+        if keep_t is not None:
+            hot &= ~keep_t
+        fixed = torch.where(hot, med, x)
+        # uint16 values are exact in float32 (< 2^24), so the round-trip cast
+        # is lossless for integer data
+        frames[:, :, k0:k1] = (
+            fixed.cpu().numpy().astype(out_dtype, copy=False).transpose(1, 2, 0)
+        )
+        del x, xp, med, diff, flat, srt, mad, sigma, thr, hot, fixed
+        if dev.type == "mps":
+            torch.mps.empty_cache()
+
+
+def _static_hot_map(frames, n_sigma, one_sided, keep, floor):
+    """(a, b) bool map of *persistently* hot pixels, from the temporal median.
+
+    The per-pixel temporal median over all frames suppresses single-frame
+    zingers, so anything still anomalous vs its 3x3 spatial neighbourhood in
+    that image is a static detector defect. The temporal median is an N-frame
+    sort over millions of pixel lanes — exactly the shape class where MPS sort
+    kernels are silently wrong — so it stays on the host in numpy (chunked
+    over detector rows); it is a single pass and not the bottleneck.
+    """
+    from scipy.ndimage import median_filter
+
+    a, b, nf = frames.shape
+    tmed = np.empty((a, b), np.float64)
+    chunk_rows = max(1, min(a, (512 * 1024 ** 2) // max(1, b * nf * 8)))
+    for r0 in range(0, a, chunk_rows):
+        blk = frames[r0:r0 + chunk_rows].astype(np.float64, copy=False)
+        tmed[r0:r0 + chunk_rows] = np.median(blk, axis=-1)
+    med = median_filter(tmed, size=3)
+    diff = tmed - med
+    mad = np.median(np.abs(diff))
+    sigma = max(1.4826 * mad, floor)
+    hot = diff > n_sigma * sigma if one_sided else np.abs(diff) > n_sigma * sigma
+    if keep is not None:
+        hot &= ~keep
+    return hot
+
+
+def _fill_static(frames, hot_map):
+    """Replace ``hot_map`` pixels in every frame by that frame's own 3x3 median.
+
+    Only the flagged pixels are touched: their 3x3 neighbourhoods are gathered
+    with clipped (edge-replicated, == scipy reflect for width 1) indices and
+    the per-frame median taken on the host. Cost is O(n_hot * n_frames), not
+    O(n_pixels * n_frames).
+    """
+    ys, xs = np.nonzero(hot_map)
+    if ys.size == 0:
+        return
+    a, b, nf = frames.shape
+    off = np.array([-1, 0, 1])
+    yn = np.clip(ys[:, None, None] + off[None, :, None], 0, a - 1)
+    xn = np.clip(xs[:, None, None] + off[None, None, :], 0, b - 1)
+    neigh = frames[yn, xn, :].reshape(ys.size, 9, nf)  # (K, 9, nf)
+    fill = np.empty((ys.size, nf), np.float64)
+    step = max(1, (256 * 1024 ** 2) // max(1, ys.size * 9 * 8))
+    for k0 in range(0, nf, step):
+        fill[:, k0:k0 + step] = np.median(
+            neigh[:, :, k0:k0 + step], axis=1
+        )
+    frames[ys, xs, :] = fill.astype(frames.dtype, copy=False)
+
+
+def remove_hot_pixels(data, n_sigma=5.0, one_sided=False, protect=None, min_sigma=None,
+                      method="frame", backend=None, device=None, chunk_frames=None):
+    """Replace hot pixels with the 3x3 spatial median.
 
     A pixel is hot in a frame when it deviates from the local median by more
     than n_sigma robust standard deviations (MAD-based) of that frame.
+
+    Detection modes (``method``):
+
+    * ``"frame"`` (default) — per-frame spatial detection, as always: each
+      frame gets its own 3x3-median comparison and robust sigma. Catches both
+      static detector defects and single-frame zingers (cosmic hits).
+    * ``"static"`` — one hot-pixel map for the whole stack: the per-pixel
+      *temporal* median image (which suppresses single-frame events) is
+      compared against its own 3x3 spatial median, and the resulting map of
+      persistently-defective detector pixels is filled in **every** frame with
+      that frame's local 3x3 median. This targets detector defects only — it
+      deliberately **misses single-frame zingers** — but is one cheap pass.
+    * ``"hybrid"`` — the static map first, then the per-frame pass on the
+      cleaned data: detector defects *and* zingers.
 
     Grain-safe options (recommended when running *after* a clamped subtract, or
     on grains with genuine interior dark sub-features):
@@ -317,6 +504,20 @@ def remove_hot_pixels(data, n_sigma=5.0, one_sided=False, protect=None, min_sigm
       drive the threshold to ~0 and flag genuine grain-interior pixels. Default
       ``None`` keeps the legacy 1e-6 floor; set e.g. ``1.0`` post-subtraction.
 
+    The library defaults above are the **legacy** (not grain-safe) settings for
+    backward compatibility. The notebook (03), :func:`starling.viz.denoise_widget`
+    and the batch runner all pass the grain-safe settings
+    ``one_sided=True, min_sigma=1.0`` explicitly — pass them yourself when
+    calling this directly on subtracted data.
+
+    Backends: the default (``backend="torch"``) batches frames on the compute
+    device (auto-select cuda > mps > cpu; ~8x faster than scipy per frame on
+    MPS, measured) and is pixel-identical to ``backend="scipy"``, the original
+    serial host loop kept for reference/parity. Integer data round-trips the
+    GPU float32 path losslessly; float64 input is processed in float32 on
+    cuda/mps (MPS has no float64 — use ``device="cpu"`` or ``backend="scipy"``
+    if that matters).
+
     Args:
         data (numpy.ndarray): shape (a, b, m[, n[, o]]), modified in place.
         n_sigma (float): detection threshold.
@@ -324,26 +525,39 @@ def remove_hot_pixels(data, n_sigma=5.0, one_sided=False, protect=None, min_sigm
         protect (numpy.ndarray, optional): (a, b) bool mask of pixels to leave
             untouched (e.g. a grain footprint).
         min_sigma (float, optional): absolute floor on the robust sigma.
+        method (str): "frame" (default), "static" or "hybrid" — see above.
+        backend (str, optional): "torch" (default) or "scipy".
+        device (str or torch.device, optional): torch device for the batched
+            backend; default auto-selects (cuda > mps > cpu).
+        chunk_frames (int, optional): frames per device chunk for the torch
+            backend; default auto-sizes to the device memory budget.
 
     Returns:
         numpy.ndarray: the same array, modified in place.
     """
-    from scipy.ndimage import median_filter
-
     a, b = data.shape[:2]
     frames = data.reshape(a, b, -1)
     keep = None if protect is None else np.asarray(protect, dtype=bool)
     floor = 1e-6 if min_sigma is None else float(min_sigma)
-    for k in range(frames.shape[-1]):
-        frame = frames[:, :, k]
-        med = median_filter(frame, size=3)
-        diff = frame.astype(np.float64) - med
-        mad = np.median(np.abs(diff))
-        sigma = max(1.4826 * mad, floor)
-        hot = diff > n_sigma * sigma if one_sided else np.abs(diff) > n_sigma * sigma
-        if keep is not None:
-            hot &= ~keep
-        frame[hot] = med[hot]
+    backend = "torch" if backend is None else backend
+    if backend not in ("torch", "scipy"):
+        raise ValueError(f"backend must be 'torch' or 'scipy', got {backend!r}")
+    if method not in ("frame", "static", "hybrid"):
+        raise ValueError(
+            f"method must be 'frame', 'static' or 'hybrid', got {method!r}"
+        )
+
+    if method in ("static", "hybrid"):
+        hot_map = _static_hot_map(frames, n_sigma, one_sided, keep, floor)
+        _fill_static(frames, hot_map)
+    if method in ("frame", "hybrid"):
+        if backend == "scipy":
+            _remove_hot_frames_scipy(frames, n_sigma, one_sided, keep, floor)
+        else:
+            _remove_hot_frames_torch(
+                frames, n_sigma, one_sided, keep, floor,
+                device=device, chunk_frames=chunk_frames,
+            )
     return data
 
 
@@ -359,11 +573,13 @@ def subtracted(data, background):
     return out
 
 
-def hot_pixels_removed(data, n_sigma=5.0, one_sided=False, protect=None, min_sigma=None):
+def hot_pixels_removed(data, n_sigma=5.0, one_sided=False, protect=None, min_sigma=None,
+                       method="frame", backend=None, device=None):
     """Non-destructive :func:`remove_hot_pixels` — returns a new array."""
     out = data.copy()
     remove_hot_pixels(
-        out, n_sigma=n_sigma, one_sided=one_sided, protect=protect, min_sigma=min_sigma
+        out, n_sigma=n_sigma, one_sided=one_sided, protect=protect,
+        min_sigma=min_sigma, method=method, backend=backend, device=device,
     )
     return out
 
@@ -536,3 +752,42 @@ def polygon_mask(shape, vertices):
     pts = np.column_stack([xx.ravel(), yy.ravel()])
     inside = Path(np.asarray(vertices, dtype=float)).contains_points(pts)
     return inside.reshape(ny, nx)
+
+
+def support_count(data, motor_axis, threshold):
+    """Per-pixel count of planes along one motor axis with any signal.
+
+    For each detector pixel, counts in how many planes along ``motor_axis``
+    (0-based among the motor dimensions) the pixel has ANY voxel strictly
+    above ``threshold`` across the remaining motor dimensions.
+
+    The intended use is gating 3-D strain-mosa fits on ccmth support: a
+    grain-edge pixel lit at only 1-3 ccmth planes cannot constrain a 3-D
+    Gaussian along ccmth (the fitted ccmth width/centre is degenerate), so
+    fits are restricted to pixels with e.g. ``support_count(...) >= 4``.
+
+    Args:
+        data (numpy.ndarray): shape (ny, nx, *motor_dims).
+        motor_axis (int): which motor dimension to count support along,
+            0-based among the motor dims (i.e. axis ``2 + motor_axis`` of
+            ``data``).
+        threshold: a plane counts only where a voxel is strictly ``>`` this
+            value (a voxel exactly at the threshold does not count).
+
+    Returns:
+        numpy.ndarray: (ny, nx) int16 — 0 for an all-dark pixel, up to
+        ``data.shape[2 + motor_axis]`` for a pixel lit at every plane.
+    """
+    n_motor = data.ndim - 2
+    if n_motor < 1:
+        raise ValueError(f"data must be (ny, nx, *motor_dims), got {data.shape}")
+    if not 0 <= motor_axis < n_motor:
+        raise ValueError(
+            f"motor_axis must be in [0, {n_motor - 1}] for {n_motor} motor "
+            f"dims, got {motor_axis}"
+        )
+    lit = data > threshold
+    other = tuple(2 + i for i in range(n_motor) if i != motor_axis)
+    if other:
+        lit = lit.any(axis=other)  # -> (ny, nx, n_planes)
+    return lit.sum(axis=-1, dtype=np.int16)
