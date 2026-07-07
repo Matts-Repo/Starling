@@ -1,3 +1,4 @@
+from ._bundle import Bundle, load_bundle, save_bundle
 from ._dataset import DataSet
 from ._metadata import ID03
 from ._nexus import load_nexus, save_dataset_nexus, save_nexus
@@ -12,6 +13,9 @@ __all__ = [
     "save_nexus",
     "load_nexus",
     "save_dataset_nexus",
+    "save_bundle",
+    "load_bundle",
+    "Bundle",
     "load_partial_scan",
     "ID03",
     "Reader",

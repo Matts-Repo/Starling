@@ -5,6 +5,8 @@ starling.io._metadata / _reader, so starling installs standalone with no
 external DFXM dependencies.
 """
 
+import warnings
+
 import h5py
 import numpy as np
 from tqdm import tqdm
@@ -43,6 +45,11 @@ class DataSet:
         device: torch device or name; None auto-detects (cuda > mps > cpu).
         verbose: print loading progress.
         allow_partial: load aborted scans by keeping complete fast-motor rows.
+        n_workers: read-process count for the loader. None (default)
+            auto-enables multiprocess reads for large scans; 0/1 forces the
+            serial reader; >= 2 forces that many worker processes. Any
+            parallel-read failure falls back to the serial path with a
+            warning, so results are unaffected.
     """
 
     def __init__(
@@ -55,6 +62,7 @@ class DataSet:
         device=None,
         verbose=True,
         allow_partial=False,
+        n_workers=None,
     ):
         self.device = get_device(device)
         self.partial_info = None
@@ -62,10 +70,15 @@ class DataSet:
         self.data = None
         self.motors = None
         self.roi = None
+        self.scan_id = None
+        self.scan_motor = None
+        self.n_workers = n_workers
 
         if isinstance(data_source, Reader):
             self.reader = data_source
             self.h5file = data_source.abs_path_to_h5_file
+            if n_workers is not None:
+                self.reader.n_workers = n_workers
         elif isinstance(data_source, str):
             self.h5file = data_source
         else:
@@ -95,6 +108,8 @@ class DataSet:
             self.reader = _PartialScan(data, motors, self.h5file, scan_id, info)
             self.data, self.motors = data, motors
             self.partial_info = info
+            self.roi = roi
+            self.scan_id = scan_id
             if verbose and not info["complete"]:
                 print(
                     f"partial scan {scan_id}: using {info['frames_used']}/"
@@ -145,12 +160,13 @@ class DataSet:
             config = ID03(self.h5file)
             reference_scan_id = scan_id[0] if isinstance(scan_id, list) else scan_id
             scan_params, _sensors = config(reference_scan_id)
+            n_workers = getattr(self, "n_workers", None)
             if scan_params["motor_names"] is None:
-                self.reader = Darks(self.h5file)
+                self.reader = Darks(self.h5file, n_workers=n_workers)
             elif len(scan_params["motor_names"]) == 1:
-                self.reader = RockingScan(self.h5file)
+                self.reader = RockingScan(self.h5file, n_workers=n_workers)
             elif len(scan_params["motor_names"]) == 2:
-                self.reader = MosaScan(self.h5file)
+                self.reader = MosaScan(self.h5file, n_workers=n_workers)
             else:
                 raise ValueError("Could not find a reader for your h5 file")
 
@@ -160,9 +176,133 @@ class DataSet:
             self._load_stacked_scans(scan_id, scan_motor, roi, verbose)
 
         self.roi = roi
+        self.scan_id = scan_id
+        self.scan_motor = scan_motor
 
     def _load_stacked_scans(self, scan_id, scan_motor, roi, verbose):
-        """Stack multiple scans along a third motor dimension."""
+        """Stack multiple scans along a third motor dimension.
+
+        For the built-in readers, all per-scan metadata (stack-motor scalars,
+        scan commands, motor grids, frame orders, detector keys) is resolved
+        in one pass over a single h5py handle, the cube is allocated once and
+        every sub-scan is read directly into its slice — via the multiprocess
+        read engine (one worker per sub-scan) when enabled, else serially.
+        Custom readers keep the legacy one-scan-at-a-time path.
+        """
+        if type(self.reader) not in (MosaScan, RockingScan):
+            return self._load_stacked_scans_generic(scan_id, scan_motor, roi, verbose)
+
+        from ._reader import (
+            _dest_chunks,
+            _frames_per_chunk,
+            _resolve_workers,
+            _roi_extent,
+            _warn_if_not_separable,
+        )
+
+        with h5py.File(self.h5file, "r") as h5f:
+            # one metadata pass: stack-motor scalars + per-scan read plans
+            scan_motor_values = np.zeros((len(scan_id),))
+            for i, sid in enumerate(scan_id):
+                scan_motor_values[i] = h5f[sid][scan_motor][()]
+
+            order = np.argsort(scan_motor_values)
+            scan_id = [scan_id[idx] for idx in order]
+            scan_motor_values = scan_motor_values[order]
+
+            plans = [(sid, *self.reader._prepare(h5f, sid)) for sid in scan_id]
+            for sid, _params, _sens, _perm, motors_i, _row_len in plans:
+                _warn_if_not_separable(motors_i, sid)
+
+            reference_motors = plans[0][4]
+            if reference_motors.ndim == 2:
+                motor1 = reference_motors[0, :]
+                motors = np.array(
+                    np.meshgrid(motor1, scan_motor_values, indexing="ij")
+                )
+            elif reference_motors.ndim == 3:
+                motor1 = reference_motors[0, :, 0]
+                motor2 = reference_motors[1, 0, :]
+                motors = np.array(
+                    np.meshgrid(motor1, motor2, scan_motor_values, indexing="ij")
+                )
+            else:
+                raise ValueError(
+                    f"Each scan_id must hold a 1D or 2D scan but "
+                    f"{reference_motors.ndim}D was found at scan_id={scan_id[0]}"
+                )
+
+            params0 = plans[0][1]
+            dset0 = h5f[scan_id[0]][params0["data_name"]]
+            rows, cols = _roi_extent(dset0.shape, roi)
+            n_frames = int(dset0.shape[0])
+            frame_bytes = rows * cols * np.dtype(np.uint16).itemsize
+            cube_shape = (
+                rows,
+                cols,
+                *(int(s) for s in params0["scan_shape"]),
+                len(scan_id),
+            )
+
+            data = None
+            n_workers = _resolve_workers(
+                self.reader.n_workers,
+                int(np.prod(cube_shape)) * np.dtype(np.uint16).itemsize,
+                len(scan_id),
+            )
+            if n_workers >= 2:
+                from . import _mpread
+
+                jobs = []
+                for k, (sid, params_i, _sens, perm_i, _mot, row_len_i) in enumerate(
+                    plans
+                ):
+                    chunks = _dest_chunks(
+                        n_frames, _frames_per_chunk(n_frames, frame_bytes, row_len_i)
+                    )
+                    jobs.append(
+                        (self.h5file, sid, params_i["data_name"], roi, perm_i, k,
+                         chunks)
+                    )
+                try:
+                    data = _mpread.read_jobs_shm(
+                        cube_shape, np.uint16, jobs, n_workers
+                    )
+                except Exception as exc:
+                    warnings.warn(
+                        f"parallel stacked load failed ({exc!r}); falling back "
+                        f"to the serial reader.",
+                        stacklevel=3,
+                    )
+            if data is None:
+                # serial: each sub-scan is placed straight into its cube slice
+                # (no per-scan temporary, no extra strided copy pass)
+                data = np.empty(cube_shape, np.uint16)
+                for k, (sid, params_i, _sens, perm_i, _mot, row_len_i) in enumerate(
+                    tqdm(plans, disable=not verbose)
+                ):
+                    self.reader._read_placed(
+                        h5f, sid, params_i, roi, perm_i, out=data[..., k],
+                        row_len=row_len_i,
+                    )
+
+        # match the legacy loop, which left the last sub-scan's metadata on
+        # the reader before appending the stack motor
+        self.reader.scan_params = plans[-1][1]
+        self.reader.sensors = plans[-1][2]
+        self.reader.scan_params["motor_names"].append(scan_motor)
+        self.reader.scan_params["scan_shape"] = np.array(
+            [*self.reader.scan_params["scan_shape"], len(scan_id)]
+        )
+        self.reader.scan_params["integrated_motors"].append(False)
+        self.reader.scan_params["scan_id"] = scan_id
+
+        self.motors = motors
+        self.data = data
+
+    def _load_stacked_scans_generic(self, scan_id, scan_motor, roi, verbose):
+        """Legacy stacked load for custom/duck-typed readers: one reader call
+        per sub-scan, copied into the cube."""
         scan_motor_values = np.zeros((len(scan_id),))
         with h5py.File(self.h5file) as h5file:
             for i, sid in enumerate(scan_id):
@@ -252,7 +392,15 @@ class DataSet:
         preprocess.subtract(self.data, background)
 
     def remove_hot_pixels(
-        self, n_sigma=5.0, one_sided=False, protect=None, min_sigma=None
+        self,
+        n_sigma=5.0,
+        one_sided=False,
+        protect=None,
+        min_sigma=None,
+        method="frame",
+        backend="torch",
+        device=None,
+        chunk_frames=None,
     ):
         preprocess.remove_hot_pixels(
             self.data,
@@ -260,6 +408,10 @@ class DataSet:
             one_sided=one_sided,
             protect=protect,
             min_sigma=min_sigma,
+            method=method,
+            backend=backend,
+            device=device,
+            chunk_frames=chunk_frames,
         )
 
     def auto_roi(self, threshold_rel=0.05, pad=20, apply=True):
@@ -336,6 +488,27 @@ class DataSet:
             progress=progress,
         )
 
+    def fit_ND_two_gaussians(self, n_iter_gauss_newton=14, mask=None,
+                             delta_bic=10.0, single=None, progress=True,
+                             **opts):
+        """Two-component N-D Gaussian fit with per-pixel BIC model selection.
+
+        Pass ``single=`` a precomputed :class:`~starling.properties.GaussNDResult`
+        (from :meth:`fit_ND_gaussian` with the same mask) to skip refitting the
+        1-peak model. See :func:`starling.properties.fit_ND_two_gaussians`.
+        """
+        return properties.fit_ND_two_gaussians(
+            self.data,
+            self.motors,
+            n_iter_gauss_newton=n_iter_gauss_newton,
+            mask=mask,
+            device=self.device,
+            delta_bic=delta_bic,
+            single=single,
+            progress=progress,
+            **opts,
+        )
+
     # ------------------------------------------------------------------ #
     # auto-dispatch + convenience (Section 7)
     # ------------------------------------------------------------------ #
@@ -353,7 +526,7 @@ class DataSet:
             return preprocess.grain_mask(self.data)
         return np.asarray(mask, dtype=bool)
 
-    def analyze(self, method="auto", mask="auto", order=2, **opts):
+    def analyze(self, method="auto", mask="auto", order=2, two_peak=False, **opts):
         """Run the appropriate analysis for this scan's dimensionality.
 
         Dispatch is by **motor-dimension count**, so a 1-D, 2-D or 3-D scan all
@@ -366,13 +539,17 @@ class DataSet:
           for the spread / mean-orientation maps).
 
         ``method`` can be forced to ``"moments"`` (-> :class:`MomentResult`),
-        ``"gauss1d"``, ``"gauss2p"`` (-> the two-peak dict), ``"gaussND"`` or
-        ``"pv"`` (-> :class:`PseudoVoigtResult`).
+        ``"gauss1d"``, ``"gauss2p"`` (-> the two-peak dict), ``"gaussND"``,
+        ``"gaussND2"`` (-> :class:`GaussNDTwoResult`) or ``"pv"``
+        (-> :class:`PseudoVoigtResult`).
 
         Args:
             method (str): "auto" or a forced method name.
             mask: "auto" (grain mask, default), None (all pixels) or a bool array.
             order (int): moment order when moments are computed (2 or 4).
+            two_peak (bool): with ``method="auto"``, run the two-peak fit for
+                this dimensionality instead ("gauss2p" for 1 motor dim,
+                "gaussND2" otherwise).
             **opts: forwarded to the underlying fit (e.g. ``n_iter_gauss_newton``).
 
         Returns:
@@ -383,7 +560,10 @@ class DataSet:
         m = self._resolve_mask(mask)
         n = self.n_motor_dims
         if method == "auto":
-            method = "gauss1d" if n == 1 else "gaussND"
+            if two_peak:
+                method = "gauss2p" if n == 1 else "gaussND2"
+            else:
+                method = "gauss1d" if n == 1 else "gaussND"
 
         if method == "moments":
             res = self.moments(order=order, mask=m)
@@ -416,9 +596,16 @@ class DataSet:
                     f"method='gauss1d' (or 'auto')."
                 )
             return self.fit_ND_gaussian(mask=m, **opts)
+        if method == "gaussND2":
+            if n < 2:
+                raise ValueError(
+                    f"gaussND2 needs >= 2 motor dims but this scan has {n}; use "
+                    f"method='gauss2p' (or two_peak=True with 'auto')."
+                )
+            return self.fit_ND_two_gaussians(mask=m, **opts)
         raise ValueError(
             f"unknown method {method!r}; expected 'auto', 'moments', 'gauss1d', "
-            f"'gauss2p', 'gaussND' or 'pv'"
+            f"'gauss2p', 'gaussND', 'gaussND2' or 'pv'"
         )
 
     def mosaicity(self, mode="scalar", axes=None, source="fit", mask="auto"):
