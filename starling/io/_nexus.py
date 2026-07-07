@@ -30,6 +30,7 @@ from ._output import _jsonable
 from ..properties import (
     Gauss1DResult,
     GaussNDResult,
+    GaussNDTwoResult,
     MomentResult,
     PseudoVoigtResult,
 )
@@ -47,11 +48,17 @@ _MOSAICITY = "Mosaicity"
 _COLOR_KEY = "Color Key"
 _KAM = "Kernel Average Misorientation"
 _MOSAICITY_SPREAD = "Mosaicity spread"  # starling extra: scalar RMS orientation spread
+# starling extras for the two-peak N-D fit (darfix has no multi-peak maps)
+_N_PEAKS = "Number of peaks"
+_PEAK_SEP = "Peak separation"
+_PEAK_SEP_MAHA = "Peak separation (Mahalanobis)"
 
 # result_kind <-> dataclass field order for the round-trip raw block.
 _RAW_FIELDS = {
     "gauss1d": ("A", "sigma", "mu", "k", "m", "success"),
     "gaussND": ("A", "mu", "cov", "c", "success"),
+    "gaussND_two": ("A1", "mu1", "cov1", "A2", "mu2", "cov2", "c",
+                    "n_peaks", "bic1", "bic2", "success"),
     "pseudovoigt": ("A", "sigma", "mu", "gamma", "eta", "k", "m", "success"),
     "gauss1d_sweep": ("A", "sigma", "mu", "k", "m", "success"),
     # moments fields are dynamic (skew/kurtosis optional) -> handled inline.
@@ -360,6 +367,7 @@ def _result_kind(result):
     return {
         "Gauss1DResult": "gauss1d",
         "GaussNDResult": "gaussND",
+        "GaussNDTwoResult": "gaussND_two",
         "PseudoVoigtResult": "pseudovoigt",
         "MomentResult": "moments",
     }[result.__class__.__name__]
@@ -456,6 +464,12 @@ def save_nexus(
         return _save_sweep_nexus(
             path, result, motors, scan_params, mask=mask, pixel_size_mm=pixel_size_mm,
             motor_units=motor_units, layer_values=layer_values, entry=entry,
+            extra_attrs=extra_attrs,
+        )
+    if kind == "gaussND_two":
+        return _save_two_peak_nexus(
+            path, result, motors, scan_params, mask=mask, pixel_size_mm=pixel_size_mm,
+            motor_units=motor_units, orientation_axes=orientation_axes, entry=entry,
             extra_attrs=extra_attrs,
         )
 
@@ -633,6 +647,88 @@ def _save_sweep_nexus(
     return path
 
 
+def _save_two_peak_nexus(
+    path, result, motors, scan_params, *, mask, pixel_size_mm, motor_units,
+    orientation_axes, entry, extra_attrs,
+):
+    """Two-peak N-D fit branch: n_peaks + per-peak/per-axis + separation maps.
+
+    Display policy mirrors the other kinds (raw block always unmasked): with a
+    grain ``mask`` the ``Number of peaks`` map is NaN'd off-grain, and the
+    per-peak / separation maps are additionally NaN'd where the two-peak model
+    was not selected (their raw fields are zero there by construction).
+    """
+    D = result.D
+    ny, nx = np.asarray(result.A1).shape
+    y, x, x_units = _image_axes(ny, nx, pixel_size_mm)
+    keep = None if mask is None else np.asarray(mask, dtype=bool)
+    keep_two = None if keep is None else keep & (np.asarray(result.success) > 0.5)
+
+    with h5py.File(path, "w") as f:
+        f.attrs["NX_class"] = "NXroot"
+        f.attrs["default"] = entry
+        ent = f.create_group(entry)
+        ent.attrs["NX_class"] = "NXentry"
+        ent.attrs["default"] = _N_PEAKS
+
+        proc = _write_process(ent, "gaussND_two")
+        raw_fields = {k: getattr(result, k) for k in _RAW_FIELDS["gaussND_two"]}
+        _write_raw(
+            proc, raw_fields, D=D, orientation_axes=orientation_axes,
+            motor_units=motor_units, mask=mask, pixel_size_mm=pixel_size_mm,
+        )
+        _write_scan_group(ent, motors, scan_params, motor_units)
+
+        _write_image_nxdata(
+            ent, _N_PEAKS,
+            _mask_display(np.asarray(result.n_peaks, dtype=np.float64), keep),
+            y, x, x_units,
+            extra_signal_attrs={
+                "quantity": "n_peaks", "source": "fit",
+                "long_name": "selected number of Gaussian components (0/1/2)",
+            },
+        )
+
+        dmu, dist = result.separation()
+        names = _short_motor_names(scan_params, D)
+        for i in range(D):
+            coll = ent.create_group(names[i])
+            coll.attrs["NX_class"] = "NXcollection"
+            for pk, mu_pk in ((1, result.mu1), (2, result.mu2)):
+                _write_image_nxdata(
+                    coll, f"{_COM} (peak {pk})",
+                    _mask_display(np.asarray(mu_pk)[..., i], keep_two),
+                    y, x, x_units,
+                    extra_signal_attrs={"quantity": "fit_peak_center",
+                                        "source": "fit", "peak": pk},
+                )
+                _write_image_nxdata(
+                    coll, f"{_FWHM} (peak {pk})",
+                    _mask_display(result.fwhm(peak=pk)[..., i], keep_two),
+                    y, x, x_units,
+                    extra_signal_attrs={"quantity": "fit_fwhm",
+                                        "source": "fit", "peak": pk},
+                )
+            _write_image_nxdata(
+                coll, _PEAK_SEP, _mask_display(dmu[..., i], keep_two),
+                y, x, x_units,
+                extra_signal_attrs={"quantity": "peak_separation",
+                                    "source": "fit", "units": motor_units,
+                                    "long_name": "mu1 - mu2 (major - minor)"},
+            )
+
+        _write_image_nxdata(
+            ent, _PEAK_SEP_MAHA, _mask_display(dist, keep_two), y, x, x_units,
+            extra_signal_attrs={
+                "quantity": "peak_separation_mahalanobis", "source": "fit",
+                "long_name": "pooled-sigma Mahalanobis peak separation",
+            },
+        )
+
+        _write_extra_attrs(f, extra_attrs)
+    return path
+
+
 # --------------------------------------------------------------------------- #
 # loader
 # --------------------------------------------------------------------------- #
@@ -678,6 +774,8 @@ def load_nexus(path):
             result = Gauss1DResult.from_dict(raw)
         elif kind == "gaussND":
             result = GaussNDResult.from_dict(raw)
+        elif kind == "gaussND_two":
+            result = GaussNDTwoResult.from_dict(raw)
         elif kind == "pseudovoigt":
             result = PseudoVoigtResult.from_dict(raw)
         elif kind == "moments":

@@ -217,3 +217,83 @@ def gaussND_const(params, x, D):
     cols.append(torch.ones_like(e))  # df/dc
     J = torch.stack(cols, dim=-1)
     return f, J
+
+
+def gaussND_two_const(params, x, D):
+    """Two N-D Gaussians (each Cholesky-of-precision) + shared constant bg.
+
+    f(v) = A1 exp(-0.5 (v - mu1)^T L1 L1^T (v - mu1))
+         + A2 exp(-0.5 (v - mu2)^T L2 L2^T (v - mu2)) + c
+
+    Each component is parameterised exactly like :func:`gaussND_const` (lower-
+    triangular L, row-major, so the precision L L^T is PSD for any real L) and
+    the same functional style (elementwise ops + ``torch.stack``, no in-place
+    writes) keeps the whole evaluation fusable under ``torch.compile``.
+
+    Parameter layout (length ``n_p = 2 * (1 + D + D(D+1)/2) + 1``):
+        ``[A1, mu1 (D), L1 (D(D+1)/2), A2, mu2 (D), L2 (D(D+1)/2), c]``.
+
+    Args:
+        params: (P, n_p) tensor.
+        x: (D, N) tensor of flattened grid coordinates.
+        D (int): number of motor dimensions (fixed per call).
+
+    Returns:
+        tuple: f (P, N), J (P, N, n_p) with columns ordered
+        [dA1, dmu1_0.., dL1_rs.., dA2, dmu2_0.., dL2_rs.., dc].
+    """
+    n_L = D * (D + 1) // 2
+    stride = 1 + D + n_L
+    c = params[:, 2 * stride]
+
+    f = c[:, None]
+    cols = []
+    for comp in range(2):
+        off = comp * stride
+        A = params[:, off]
+        mu = [params[:, off + 1 + i] for i in range(D)]
+        L_flat = [params[:, off + 1 + D + t] for t in range(n_L)]
+
+        # row-major lower-triangular index map L[r][s] (r >= s)
+        Lmat = [[None] * D for _ in range(D)]
+        t = 0
+        for r in range(D):
+            for s in range(r + 1):
+                Lmat[r][s] = L_flat[t]
+                t += 1
+
+        d = [x[j][None, :] - mu[j][:, None] for j in range(D)]  # each (P, N)
+
+        # u = L^T d  =>  u_k = sum_{j >= k} L_{jk} d_j
+        u = []
+        for k in range(D):
+            acc = Lmat[k][k][:, None] * d[k]
+            for j in range(k + 1, D):
+                acc = acc + Lmat[j][k][:, None] * d[j]
+            u.append(acc)
+
+        q = u[0] * u[0]
+        for k in range(1, D):
+            q = q + u[k] * u[k]
+        e = torch.exp(-0.5 * q)
+        Ae = A[:, None] * e
+        f = f + Ae
+
+        # Lu_i = sum_{k <= i} L_{ik} u_k  (for the mu derivatives)
+        Lu = []
+        for i in range(D):
+            acc = Lmat[i][0][:, None] * u[0]
+            for k in range(1, i + 1):
+                acc = acc + Lmat[i][k][:, None] * u[k]
+            Lu.append(acc)
+
+        cols.append(e)
+        for i in range(D):
+            cols.append(Ae * Lu[i])  # df/dmu_i = Ae (Lu)_i
+        for r in range(D):
+            for s in range(r + 1):
+                cols.append(-Ae * u[s] * d[r])  # df/dL_rs = -Ae u_s d_r
+
+    cols.append(torch.ones_like(f))  # df/dc
+    J = torch.stack(cols, dim=-1)
+    return f, J

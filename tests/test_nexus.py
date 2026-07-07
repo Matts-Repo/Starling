@@ -16,6 +16,7 @@ from starling import load_nexus, save_dataset_nexus, save_nexus
 from starling.properties import (
     Gauss1DResult,
     GaussNDResult,
+    GaussNDTwoResult,
     MomentResult,
     PseudoVoigtResult,
 )
@@ -84,6 +85,29 @@ def _moments_1d(ny=NY, nx=NX, seed=4):
                         rng.uniform(0.01, 0.1, (ny, nx)))
 
 
+def _gaussnd_two(ny=NY, nx=NX, D=2, seed=5):
+    """Mirror the fit output invariants: n_peaks in {0,1,2}, success == 2-peak
+    selection, all per-peak fields zeroed where the model was not selected."""
+    rng = np.random.default_rng(seed)
+    n_peaks = rng.integers(0, 3, (ny, nx)).astype(np.uint8)
+    two = (n_peaks == 2).astype(np.float64)
+    sel2 = two[..., None]
+    sel3 = two[..., None, None]
+    return GaussNDTwoResult(
+        A1=rng.uniform(1.5, 2.0, (ny, nx)) * two,
+        mu1=rng.normal(0.0, 0.1, (ny, nx, D)) * sel2,
+        cov1=_spd_cov(ny, nx, D, rng) * sel3,
+        A2=rng.uniform(0.5, 1.4, (ny, nx)) * two,
+        mu2=rng.normal(0.3, 0.1, (ny, nx, D)) * sel2,
+        cov2=_spd_cov(ny, nx, D, rng) * sel3,
+        c=rng.uniform(0.0, 0.1, (ny, nx)) * two,
+        n_peaks=n_peaks,
+        bic1=rng.normal(-100.0, 10.0, (ny, nx)),
+        bic2=rng.normal(-120.0, 10.0, (ny, nx)),
+        success=two,
+    )
+
+
 def _save(tmp_path, result, **kw):
     p = tmp_path / "out.nxs"
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -143,6 +167,85 @@ def test_roundtrip_moments_1d(tmp_path):
     assert np.allclose(res.covariance, m.covariance)
     assert meta["D"] == 1
     assert "Center of mass" in maps and "FWHM" in maps
+
+
+def test_roundtrip_gaussnd_two(tmp_path):
+    g = _gaussnd_two()
+    res, maps, meta = load_nexus(_save(tmp_path, g))
+    assert isinstance(res, GaussNDTwoResult)
+    for f in ("A1", "mu1", "cov1", "A2", "mu2", "cov2", "c",
+              "bic1", "bic2", "success"):
+        assert np.allclose(getattr(res, f), getattr(g, f)), f
+    assert np.array_equal(res.n_peaks, g.n_peaks)
+    assert res.n_peaks.dtype == np.uint8
+    assert meta["result_kind"] == "gaussND_two"
+    assert meta["D"] == 2
+
+
+def test_roundtrip_gaussnd_two_d3(tmp_path):
+    g = _gaussnd_two(ny=5, nx=4, D=3)
+    res, _, meta = load_nexus(_save(tmp_path, g))
+    assert meta["D"] == 3
+    assert np.allclose(res.mu2, g.mu2)
+    assert np.allclose(res.cov1, g.cov1)
+
+
+def test_gaussnd_two_display_maps(tmp_path):
+    g = _gaussnd_two()
+    p = _save(tmp_path, g)
+    with h5py.File(p) as f:
+        ent = f["entry"]
+        assert ent.attrs["default"] == "Number of peaks"
+        npk = ent["Number of peaks/Number of peaks"]
+        assert npk.shape == (NY, NX)
+        assert np.array_equal(npk[()], g.n_peaks.astype(np.float64))
+        assert npk.attrs["quantity"] == "n_peaks"
+        assert "Peak separation (Mahalanobis)" in ent
+        for motor in ("axis0", "axis1"):
+            coll = ent[motor]
+            for name in ("Center of mass (peak 1)", "Center of mass (peak 2)",
+                         "FWHM (peak 1)", "FWHM (peak 2)", "Peak separation"):
+                assert name in coll, (motor, name)
+            com1 = coll["Center of mass (peak 1)/Center of mass (peak 1)"]
+            i = 0 if motor == "axis0" else 1
+            assert np.allclose(com1[()], g.mu1[..., i])
+            sep = coll["Peak separation/Peak separation"][()]
+            assert np.allclose(sep, (g.mu1 - g.mu2)[..., i])
+
+
+def test_gaussnd_two_mask_display_only(tmp_path):
+    g = _gaussnd_two()
+    # ensure at least one on-grain 2-peak and one on-grain non-2-peak pixel
+    g.n_peaks[1, 1] = 2
+    g.success[1, 1] = 1.0
+    g.mu1[1, 1] = 0.05
+    g.n_peaks[2, 2] = 1
+    g.success[2, 2] = 0.0
+    mask = np.ones((NY, NX), dtype=bool)
+    mask[0, 0] = False
+    p = _save(tmp_path, g, mask=mask)
+    with h5py.File(p) as f:
+        ent = f["entry"]
+        npk = ent["Number of peaks/Number of peaks"][()]
+        assert np.isnan(npk[0, 0])           # off-grain -> NaN
+        assert np.isfinite(npk[2, 2])        # on-grain single-peak visible
+        com1 = ent["axis0/Center of mass (peak 1)/Center of mass (peak 1)"][()]
+        assert np.isnan(com1[0, 0])          # off-grain
+        assert np.isnan(com1[2, 2])          # on-grain but not 2-peak
+        assert np.isfinite(com1[1, 1])       # bimodal pixel shown
+        # raw block unmasked and exact
+        assert np.allclose(f["entry/starling_process/raw/mu1"][()], g.mu1)
+    res, _, _ = load_nexus(p)
+    assert np.allclose(res.mu1, g.mu1)
+
+
+def test_gaussnd_two_silx_can_parse(tmp_path):
+    silx = pytest.importorskip("silx")  # noqa: F841
+    from silx.io.nxdata import get_default
+
+    default = get_default(_save(tmp_path, _gaussnd_two()))
+    assert default is not None
+    assert default.signal is not None
 
 
 # ------------------------------- NeXus attrs ------------------------------- #

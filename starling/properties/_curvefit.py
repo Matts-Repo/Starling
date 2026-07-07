@@ -14,9 +14,10 @@ import torch
 
 from ..device import compute_dtype, get_device, plan_chunks
 from ._gaussnewton import gauss_newton_batched
-from ._init_guess import gaussian_seed, linear_trend
-from ._models import gauss1d_lin, gaussND_const, pseudovoigt1d_lin
-from ._results import GaussNDResult, PseudoVoigtResult
+from ._init_guess import gaussian_seed, linear_trend, two_peak_seed_nd
+from ._linalg import masked_inv_spd
+from ._models import gauss1d_lin, gaussND_const, gaussND_two_const, pseudovoigt1d_lin
+from ._results import GaussNDResult, GaussNDTwoResult, PseudoVoigtResult
 
 
 def fit_1D_gaussian(data, coordinates, n_iter_gauss_newton=7, mask=None, device=None):
@@ -535,7 +536,14 @@ def _fit_ND_engine(data, coordinates, n_iter_gauss_newton, mask, device,
         cov_safe = cov_np.copy()
         cov_safe[deg_np] = eye
         cov_safe = 0.5 * (cov_safe + np.swapaxes(cov_safe, -1, -2))
-        precision = np.linalg.inv(cov_safe)
+        # batched np.linalg.inv raises for the whole chunk if any single
+        # pixel's moment covariance is exactly singular (e.g. all the signal
+        # mass on two diagonal voxels) — invert the invertible set and fold
+        # the rest into the degenerate mask (dummy seed, success=0).
+        precision, seed_ok = masked_inv_spd(cov_safe)
+        if not seed_ok.all():
+            deg_np = deg_np | ~seed_ok
+            degenerate = degenerate | torch.as_tensor(~seed_ok).to(dev)
         precision = 0.5 * (precision + np.swapaxes(precision, -1, -2)) + 1e-9 * eye
         L_seed = _safe_chol_lower(precision)
         L_seed[deg_np] = eye
@@ -569,16 +577,19 @@ def _fit_ND_engine(data, coordinates, n_iter_gauss_newton, mask, device,
         for t, (r, s) in enumerate(tril):
             Lf[:, r, s] = params_np[:, 1 + D + t]
         precision_f = Lf @ np.swapaxes(Lf, -1, -2)  # L L^T (scaled coords)
-        det_f = np.linalg.det(precision_f)
-        bad = ~np.isfinite(det_f) | (np.abs(det_f) < 1e-300)
-        precision_f[bad] = eye
-        cov_f = np.linalg.inv(precision_f)
+        # a diverged pixel can fit a rank-deficient precision (zero Cholesky
+        # diagonal at float32); batched np.linalg.inv would raise for the
+        # whole chunk on that one pixel (observed on real MA6278 mosa scans).
+        # masked_inv_spd inverts the invertible set and flags the rest, which
+        # are zeroed with success=0 below.
+        cov_f, inv_ok = masked_inv_spd(precision_f)
         cov_f = cov_f * (xs[None, :, None] * xs[None, None, :])  # back to motor units
 
-        # zero the outputs of non-converged / degenerate pixels so no garbage
-        # (e.g. a window-mean mu or an inverted dummy covariance) leaks into the
-        # result maps or into mosaicity()/orientation(), which do not re-mask
-        ok_np = ok.detach().cpu().numpy()
+        # zero the outputs of non-converged / degenerate / singular-precision
+        # pixels so no garbage (e.g. a window-mean mu or an inverted dummy
+        # covariance) leaks into the result maps or into mosaicity()/
+        # orientation(), which do not re-mask
+        ok_np = ok.detach().cpu().numpy() & inv_ok
         A_f = np.where(ok_np, A_f, 0.0)
         mu_f = np.where(ok_np[:, None], mu_f, 0.0)
         cov_f = np.where(ok_np[:, None, None], cov_f, 0.0)
@@ -661,3 +672,440 @@ def fit_2D_gaussian(data, coordinates, n_iter_gauss_newton=10, mask=None, device
         data, coordinates, n_iter_gauss_newton=n_iter_gauss_newton,
         mask=mask, device=device,
     ).raw
+
+
+# per-dimension cached closure for the two-component model (see _ND_MODEL_CACHE)
+_ND2_MODEL_CACHE = {}
+
+
+def _nd2_model(D):
+    if D not in _ND2_MODEL_CACHE:
+        _ND2_MODEL_CACHE[D] = lambda params, x: gaussND_two_const(params, x, D)
+    return _ND2_MODEL_CACHE[D]
+
+
+def fit_ND_two_gaussians(
+    data,
+    coordinates,
+    n_iter_gauss_newton=14,
+    mask=None,
+    device=None,
+    delta_bic=10.0,
+    single=None,
+    lam=1e-1,
+    adaptive=True,
+    progress=True,
+    min_separation_samples=2,
+):
+    """Fit 1- and 2-component N-D Gaussian models per pixel, with BIC selection.
+
+    The N-D generalisation of :func:`fit_two_gaussians_1D`: both models share a
+    constant background and each component is Cholesky-of-precision
+    parameterised (:func:`~._models.gaussND_two_const`). A pixel is classified
+    2-peak when ``BIC2 + delta_bic < BIC1`` *and* the physical gates pass, all
+    evaluated in the centred/scaled coordinates (motor span mapped to [-1, 1],
+    curves normalised to <= 1):
+
+    * both amplitudes positive,
+    * both centres inside the scanned span (|mu| < 1.5 per axis),
+    * both widths physical (1e-6 < sigma < 2.0 per axis, from the fitted
+      covariance diagonal),
+    * peak separation meaningful: |delta mu| > 2 motor steps along at least
+      one axis (the N-D mirror of the 1-D "2 motor step" gate; use
+      :meth:`GaussNDTwoResult.separation` for a Mahalanobis-distance map to
+      filter harder post hoc).
+
+    Seeding is deterministic and batched: the two highest separated local
+    maxima of the smoothed D-dim curve seed the centres, per-peak second
+    moments of the Voronoi partition of the signal seed the widths, and pixels
+    with a single hump fall back to splitting the single-Gaussian moment seed
+    along its principal covariance axis (mu0 +/- sigma_max, half amplitude
+    each).
+
+    Peaks in the result are sorted by fitted amplitude, **descending**
+    (peak 1 = major component); an N-D scan has no natural axis to sort by.
+
+    Args:
+        data (numpy.ndarray): shape (ny, nx, *grid) with ``len(grid) == D``.
+        coordinates (numpy.ndarray): shape (D, *grid) motor meshgrids.
+        n_iter_gauss_newton (int): Gauss-Newton iterations for the 2-peak
+            model. Defaults to 14 (the mixture has 13 parameters for D=2 and
+            21 for D=3, and needs more iterations than the single fit's 10).
+        mask (numpy.ndarray): optional (ny, nx) bool; only True pixels are fit.
+        device: torch device or name; None auto-detects.
+        delta_bic (float): margin BIC2 must win by to select the 2-peak model
+            (same convention as :func:`fit_two_gaussians_1D`).
+        single: optional precomputed :class:`GaussNDResult` for this exact
+            data/mask — its parameters are reused for BIC1 instead of refitting
+            the 1-peak model (the efficient path when the single-Gaussian map
+            is needed anyway). When None, the 1-peak model is fitted internally
+            (10 iterations) and discarded apart from its BIC.
+        lam (float): initial Levenberg-Marquardt damping.
+        adaptive (bool): per-pixel adaptive damping (recommended).
+        progress (bool): tqdm progress bar.
+        min_separation_samples (int): per-axis half-width (in grid samples) of
+            the exclusion window used by the two-peak seeding.
+
+    Returns:
+        GaussNDTwoResult: per-peak A/mu/cov (motor units, amplitude-sorted),
+        shared c, n_peaks (0/1/2), bic1, bic2 and success (1.0 exactly where
+        n_peaks == 2). Per-peak fields are zero wherever the 2-peak model was
+        not selected.
+    """
+    coordinates = np.asarray(coordinates, dtype=np.float64)
+    D = coordinates.shape[0]
+    if data.ndim != D + 2:
+        raise ValueError(
+            f"data must be a {D + 2}d numpy array for {D} motor dimensions but "
+            f"got {data.ndim} dimensions"
+        )
+    if coordinates.shape != (D, *data.shape[2:]):
+        raise ValueError(
+            f"coordinates shape {coordinates.shape} does not match "
+            f"(D={D}, {data.shape[2:]})"
+        )
+
+    ny, nx = data.shape[:2]
+    grid = data.shape[2:]
+    N = int(np.prod(grid))
+    Y = data.reshape(ny * nx, N)
+    idx = np.flatnonzero(mask.ravel()) if mask is not None else np.arange(ny * nx)
+
+    dev = get_device(device)
+    dtype = compute_dtype(dev)
+
+    c_flat = coordinates.reshape(D, N)
+    xc = c_flat.mean(axis=1)  # (D,)
+    xs = np.maximum(np.ptp(c_flat, axis=1) / 2.0, 1e-12)  # (D,)
+    ch = torch.as_tensor((c_flat - xc[:, None]) / xs[:, None], dtype=dtype, device=dev)
+
+    # per-axis motor step in scaled coordinates (drives the separation gate)
+    step_scaled = np.empty(D)
+    for i in range(D):
+        sl = tuple(slice(None) if j == i else 0 for j in range(D))
+        vec = (np.asarray(coordinates[i][sl], dtype=np.float64) - xc[i]) / xs[i]
+        step_scaled[i] = float(np.abs(np.diff(vec)).mean()) if vec.size > 1 else 0.0
+    step_scaled = np.maximum(step_scaled, 1e-12)
+
+    model1 = _nd_model(D)
+    model2 = _nd2_model(D)
+    n_L = D * (D + 1) // 2
+    stride = 1 + D + n_L  # per-component parameter count
+    n_p1 = stride + 1
+    n_p2 = 2 * stride + 1
+    tril = [(r, s) for r in range(D) for s in range(r + 1)]  # row-major lower-tri
+    eye = np.eye(D)
+    big = 1e30
+
+    if single is not None:
+        if np.asarray(single.mu).shape != (ny, nx, D):
+            raise ValueError(
+                f"single result mu shape {np.asarray(single.mu).shape} does not "
+                f"match this data (expected ({ny}, {nx}, {D}))"
+            )
+        s_A = np.asarray(single.A, dtype=np.float64).reshape(-1)
+        s_mu = np.asarray(single.mu, dtype=np.float64).reshape(-1, D)
+        s_cov = np.asarray(single.cov, dtype=np.float64).reshape(-1, D, D)
+        s_c = np.asarray(single.c, dtype=np.float64).reshape(-1)
+        s_ok = np.asarray(single.success).reshape(-1) > 0
+
+    out_A1 = np.zeros(ny * nx)
+    out_mu1 = np.zeros((ny * nx, D))
+    out_cov1 = np.zeros((ny * nx, D, D))
+    out_A2 = np.zeros(ny * nx)
+    out_mu2 = np.zeros((ny * nx, D))
+    out_cov2 = np.zeros((ny * nx, D, D))
+    out_c = np.zeros(ny * nx)
+    out_n = np.zeros(ny * nx, dtype=np.uint8)
+    out_b1 = np.zeros(ny * nx)
+    out_b2 = np.zeros(ny * nx)
+    out_s = np.zeros(ny * nx)
+
+    # box bounds (scaled coordinates): positive bounded amplitudes and in-span
+    # centres prevent the runaway divergence multi-peak fits are prone to; the
+    # Cholesky factors and background stay free (L is sign-free by design)
+    lo_b = torch.full((n_p2,), -torch.inf, dtype=dtype)
+    hi_b = torch.full((n_p2,), torch.inf, dtype=dtype)
+    for off in (0, stride):
+        lo_b[off] = 0.0
+        hi_b[off] = 4.0
+        lo_b[off + 1 : off + 1 + D] = -1.5
+        hi_b[off + 1 : off + 1 + D] = 1.5
+    lo_b[2 * stride] = -10.0
+    hi_b[2 * stride] = 10.0
+    lo_b = lo_b.to(dev)
+    hi_b = hi_b.to(dev)
+
+    bytes_per_pixel = dtype.itemsize * N * (3 + n_p2) * 2
+    chunk = plan_chunks(len(idx), bytes_per_pixel, dev)
+
+    from tqdm.auto import tqdm
+
+    pbar = tqdm(
+        total=len(idx), desc=f"fit {D}D two-gaussian", unit="px", unit_scale=True,
+        disable=not progress or len(idx) == 0, leave=True,
+    )
+    for lo_i in range(0, len(idx), chunk):
+        sel = idx[lo_i : lo_i + chunk]
+        n_sel = len(sel)
+        block = Y[sel]
+        if n_sel < chunk and lo_i > 0:
+            block = np.concatenate(
+                [block, np.repeat(block[:1], chunk - n_sel, axis=0)]
+            )
+        # cast to the compute dtype on the host *before* moving to the device:
+        # float64 cannot live on MPS, so as_tensor(..., device=mps) on a float64
+        # block would raise before the .to(dtype) downcast could run
+        y = torch.as_tensor(np.ascontiguousarray(block), dtype=dtype).to(dev)
+        ys = y.amax(-1).clamp_min(1.0)
+        yn = y / ys[:, None]
+        ys_np = ys.detach().cpu().double().numpy()
+
+        # --- single-Gaussian moment seed (shared with the fallback split) ----
+        c0 = yn.amin(-1)
+        w = (yn - c0[:, None]).clamp_min(0.0)
+        I = w.sum(-1).clamp_min(1e-12)
+        mu = (w @ ch.T) / I[:, None]  # (P, D)
+        d = ch[None, :, :] - mu[:, :, None]  # (P, D, N)
+        cov = torch.einsum("pin,pjn->pij", d * w[:, None, :], d) / I[:, None, None]
+        diagcov = torch.einsum("...ii->...i", cov)
+        degenerate = (diagcov <= 1e-10).any(-1) | (I <= 1e-6)
+        A0 = (yn.amax(-1) - c0).clamp_min(1e-3)
+
+        cov_np = cov.detach().cpu().double().numpy()
+        deg_np = degenerate.cpu().numpy()
+        mu_np = mu.detach().cpu().double().numpy()
+        A0_np = A0.detach().cpu().double().numpy()
+        c0_np = c0.detach().cpu().double().numpy()
+        cov_safe = cov_np.copy()
+        cov_safe[deg_np] = eye
+        cov_safe = 0.5 * (cov_safe + np.swapaxes(cov_safe, -1, -2))
+        precision, seed_ok = masked_inv_spd(cov_safe)
+        if not seed_ok.all():
+            deg_np = deg_np | ~seed_ok
+            degenerate = degenerate | torch.as_tensor(~seed_ok).to(dev)
+            cov_safe[~seed_ok] = eye  # keep the split fallback finite
+        precision = 0.5 * (precision + np.swapaxes(precision, -1, -2)) + 1e-9 * eye
+
+        # --- 1-peak model: internal fit, or reconstruct from ``single`` ------
+        if single is None:
+            L_seed = _safe_chol_lower(precision)
+            L_seed[deg_np] = eye
+            mu1p = mu_np.copy()
+            mu1p[deg_np] = 0.0
+            L_flat = np.stack([L_seed[:, r, s] for (r, s) in tril], axis=-1)
+            seed1 = np.concatenate(
+                [A0_np[:, None], mu1p, L_flat, c0_np[:, None]], axis=1
+            )
+            p1_0 = torch.as_tensor(seed1, dtype=dtype).to(dev)
+            p1, ok1_t = gauss_newton_batched(
+                yn, ch, p1_0, model1, n_iter=10, lam=lam, adaptive=adaptive
+            )
+            ok1_np = (ok1_t & ~degenerate).cpu().numpy()
+            f1, _ = model1(p1, ch)
+        else:
+            blkA, blkmu = s_A[sel], s_mu[sel]
+            blkcov, blkc, blkok = s_cov[sel], s_c[sel], s_ok[sel]
+            if n_sel < chunk and lo_i > 0:
+                pad = chunk - n_sel
+                blkA = np.concatenate([blkA, np.repeat(blkA[:1], pad, axis=0)])
+                blkmu = np.concatenate([blkmu, np.repeat(blkmu[:1], pad, axis=0)])
+                blkcov = np.concatenate([blkcov, np.repeat(blkcov[:1], pad, axis=0)])
+                blkc = np.concatenate([blkc, np.repeat(blkc[:1], pad, axis=0)])
+                blkok = np.concatenate([blkok, np.repeat(blkok[:1], pad, axis=0)])
+            # back to scaled coordinates / normalised intensities
+            cov_sc = blkcov / (xs[None, :, None] * xs[None, None, :])
+            prec_sc, inv1_ok = masked_inv_spd(cov_sc)
+            ok1_np = blkok & inv1_ok
+            P_t = torch.as_tensor(prec_sc, dtype=dtype).to(dev)
+            mu_t = torch.as_tensor((blkmu - xc[None, :]) / xs[None, :],
+                                   dtype=dtype).to(dev)
+            A_t = torch.as_tensor(blkA / ys_np, dtype=dtype).to(dev)
+            c_t = torch.as_tensor(blkc / ys_np, dtype=dtype).to(dev)
+            dd = ch[None, :, :] - mu_t[:, :, None]  # (P, D, N)
+            q = torch.einsum("pij,pin,pjn->pn", P_t, dd, dd)
+            f1 = A_t[:, None] * torch.exp(-0.5 * q) + c_t[:, None]
+        rss1 = ((yn - f1) ** 2).sum(-1).clamp_min(1e-30)
+
+        # --- two-peak seed: top-2 separated local maxima ----------------------
+        i1, i2, v1, v2, has2 = two_peak_seed_nd(
+            w, grid, min_separation_samples=min_separation_samples
+        )
+        mu1_pk = ch.index_select(1, i1).permute(1, 0)  # (P, D)
+        mu2_pk = ch.index_select(1, i2).permute(1, 0)
+        # per-peak second moments of the Voronoi partition of the signal
+        d1 = ch[None, :, :] - mu1_pk[:, :, None]  # (P, D, N)
+        d2 = ch[None, :, :] - mu2_pk[:, :, None]
+        near1 = (d1 * d1).sum(1) <= (d2 * d2).sum(1)
+        w1 = w * near1
+        w2 = w * ~near1
+        I1 = w1.sum(-1).clamp_min(1e-12)
+        I2 = w2.sum(-1).clamp_min(1e-12)
+        cov1_pk = torch.einsum("pin,pjn->pij", d1 * w1[:, None, :], d1) / I1[:, None, None]
+        cov2_pk = torch.einsum("pin,pjn->pij", d2 * w2[:, None, :], d2) / I2[:, None, None]
+
+        has2_np = has2.cpu().numpy()
+        v1_np = v1.detach().cpu().double().numpy()
+        v2_np = v2.detach().cpu().double().numpy()
+        mu1_pk_np = mu1_pk.detach().cpu().double().numpy()
+        mu2_pk_np = mu2_pk.detach().cpu().double().numpy()
+        cov1_pk_np = cov1_pk.detach().cpu().double().numpy()
+        cov2_pk_np = cov2_pk.detach().cpu().double().numpy()
+
+        # fallback for single-hump pixels: split the single-Gaussian moment
+        # seed along its principal covariance axis (mu0 +/- 1 sigma, half
+        # amplitude each, principal width shrunk to 0.6 sigma per component)
+        try:
+            evals, evecs = np.linalg.eigh(cov_safe)  # ascending eigenvalues
+        except np.linalg.LinAlgError:  # pragma: no cover - cov_safe is finite
+            dg = np.einsum("...ii->...i", cov_safe)
+            ax = np.argmax(dg, axis=-1)
+            evecs = np.zeros_like(cov_safe)
+            evecs[np.arange(len(ax)), ax, -1] = 1.0
+            evals = np.zeros((len(ax), D))
+            evals[:, -1] = dg[np.arange(len(ax)), ax]
+        lam_max = np.clip(evals[:, -1], 1e-12, None)
+        vmax = evecs[:, :, -1]
+        sig_split = np.sqrt(lam_max)
+        mu_s1 = mu_np - sig_split[:, None] * vmax
+        mu_s2 = mu_np + sig_split[:, None] * vmax
+        cov_split = cov_safe - 0.64 * lam_max[:, None, None] * (
+            vmax[:, :, None] * vmax[:, None, :]
+        )
+
+        h2 = has2_np
+        A1s = np.clip(np.where(h2, v1_np, 0.5 * A0_np), 1e-3, None)
+        A2s = np.clip(np.where(h2, v2_np, 0.5 * A0_np), 1e-3, None)
+        mu1_seed = np.where(h2[:, None], mu1_pk_np, mu_s1)
+        mu2_seed = np.where(h2[:, None], mu2_pk_np, mu_s2)
+        cov1_seed = np.where(h2[:, None, None], cov1_pk_np, cov_split)
+        cov2_seed = np.where(h2[:, None, None], cov2_pk_np, cov_split)
+
+        # degenerate-safe width seeds: floor each covariance diagonal at one
+        # motor step so a thin/empty Voronoi partition still inverts cleanly
+        floor = np.diag(step_scaled ** 2)
+        cov1_seed = 0.5 * (cov1_seed + np.swapaxes(cov1_seed, -1, -2)) + floor
+        cov2_seed = 0.5 * (cov2_seed + np.swapaxes(cov2_seed, -1, -2)) + floor
+        prec1_s, ok1_s = masked_inv_spd(cov1_seed)
+        prec2_s, ok2_s = masked_inv_spd(cov2_seed)
+        L1_seed = _safe_chol_lower(prec1_s + 1e-9 * eye)
+        L2_seed = _safe_chol_lower(prec2_s + 1e-9 * eye)
+        L1_seed[deg_np | ~ok1_s] = eye
+        L2_seed[deg_np | ~ok2_s] = eye
+        mu1_seed[deg_np] = 0.0
+        mu2_seed[deg_np] = 0.0
+
+        L1_flat = np.stack([L1_seed[:, r, s] for (r, s) in tril], axis=-1)
+        L2_flat = np.stack([L2_seed[:, r, s] for (r, s) in tril], axis=-1)
+        seed2 = np.concatenate(
+            [A1s[:, None], mu1_seed, L1_flat,
+             A2s[:, None], mu2_seed, L2_flat, c0_np[:, None]], axis=1,
+        )
+        p2_0 = torch.as_tensor(seed2, dtype=dtype).to(dev)
+
+        p2, ok2_t = gauss_newton_batched(
+            yn, ch, p2_0, model2, n_iter=n_iter_gauss_newton, lam=lam,
+            adaptive=adaptive, bounds=(lo_b, hi_b),
+        )
+        ok2_np = (ok2_t & ~degenerate).cpu().numpy()
+        f2, _ = model2(p2, ch)
+        rss2 = ((yn - f2) ** 2).sum(-1).clamp_min(1e-30)
+
+        # --- BIC on the scaled data ------------------------------------------
+        n_pts = float(N)
+        bic1_np = (
+            n_pts * torch.log(rss1 / n_pts) + n_p1 * np.log(n_pts)
+        ).detach().cpu().double().numpy()
+        bic2_np = (
+            n_pts * torch.log(rss2 / n_pts) + n_p2 * np.log(n_pts)
+        ).detach().cpu().double().numpy()
+        # a diverged fit (NaN residuals) or failed solve must lose selection
+        bic1_np = np.where(np.isfinite(bic1_np) & ok1_np, bic1_np, big)
+        bic2_np = np.where(np.isfinite(bic2_np) & ok2_np, bic2_np, big)
+
+        # --- un-transform the 2-peak parameters -------------------------------
+        p2_np = p2.detach().cpu().double().numpy()
+        a1 = p2_np[:, 0]
+        mu1_sc = p2_np[:, 1 : 1 + D]
+        a2 = p2_np[:, stride]
+        mu2_sc = p2_np[:, stride + 1 : stride + 1 + D]
+        c_sc = p2_np[:, 2 * stride]
+        L1f = np.zeros((len(p2_np), D, D))
+        L2f = np.zeros((len(p2_np), D, D))
+        for t, (r, s) in enumerate(tril):
+            L1f[:, r, s] = p2_np[:, 1 + D + t]
+            L2f[:, r, s] = p2_np[:, stride + 1 + D + t]
+        cov1_sc, inv1_f = masked_inv_spd(L1f @ np.swapaxes(L1f, -1, -2))
+        cov2_sc, inv2_f = masked_inv_spd(L2f @ np.swapaxes(L2f, -1, -2))
+
+        # --- physical gates + model selection (scaled coordinates) ------------
+        sep_ok = (np.abs(mu1_sc - mu2_sc) > 2.0 * step_scaled[None, :]).any(-1)
+        amp_ok = (a1 > 0) & (a2 > 0)
+        in_span = (np.abs(mu1_sc) < 1.5).all(-1) & (np.abs(mu2_sc) < 1.5).all(-1)
+        sig1 = np.sqrt(np.clip(np.einsum("...ii->...i", cov1_sc), 0.0, None))
+        sig2 = np.sqrt(np.clip(np.einsum("...ii->...i", cov2_sc), 0.0, None))
+        width_ok = (
+            (sig1 > 1e-6).all(-1) & (sig1 < 2.0).all(-1)
+            & (sig2 > 1e-6).all(-1) & (sig2 < 2.0).all(-1)
+        )
+        two = (
+            ok2_np & inv1_f & inv2_f & sep_ok & amp_ok & width_ok & in_span
+            & (bic2_np + delta_bic < bic1_np)
+        )
+        n_pk = np.where(two, 2, np.where(ok1_np, 1, 0)).astype(np.uint8)
+
+        # --- back to motor units; sort peaks by amplitude, descending ---------
+        A1_f = a1 * ys_np
+        A2_f = a2 * ys_np
+        mu1_f = xc[None, :] + xs[None, :] * mu1_sc
+        mu2_f = xc[None, :] + xs[None, :] * mu2_sc
+        cov1_f = cov1_sc * (xs[None, :, None] * xs[None, None, :])
+        cov2_f = cov2_sc * (xs[None, :, None] * xs[None, None, :])
+        c_f = c_sc * ys_np
+
+        first_major = A1_f >= A2_f
+        A_maj = np.where(first_major, A1_f, A2_f)
+        A_min = np.where(first_major, A2_f, A1_f)
+        mu_maj = np.where(first_major[:, None], mu1_f, mu2_f)
+        mu_min = np.where(first_major[:, None], mu2_f, mu1_f)
+        cov_maj = np.where(first_major[:, None, None], cov1_f, cov2_f)
+        cov_min = np.where(first_major[:, None, None], cov2_f, cov1_f)
+
+        # zero everything that is not a selected two-peak pixel (starling's
+        # zero-degenerate-pixels convention: nothing leaks into the maps)
+        A_maj = np.where(two, A_maj, 0.0)
+        A_min = np.where(two, A_min, 0.0)
+        mu_maj = np.where(two[:, None], mu_maj, 0.0)
+        mu_min = np.where(two[:, None], mu_min, 0.0)
+        cov_maj = np.where(two[:, None, None], cov_maj, 0.0)
+        cov_min = np.where(two[:, None, None], cov_min, 0.0)
+        c_f = np.where(two, c_f, 0.0)
+
+        keep = slice(0, n_sel)
+        out_A1[sel] = A_maj[keep]
+        out_mu1[sel] = mu_maj[keep]
+        out_cov1[sel] = cov_maj[keep]
+        out_A2[sel] = A_min[keep]
+        out_mu2[sel] = mu_min[keep]
+        out_cov2[sel] = cov_min[keep]
+        out_c[sel] = c_f[keep]
+        out_n[sel] = n_pk[keep]
+        out_b1[sel] = bic1_np[keep]
+        out_b2[sel] = bic2_np[keep]
+        out_s[sel] = two[keep].astype(float)
+        pbar.update(n_sel)
+
+    pbar.close()
+    return GaussNDTwoResult(
+        A1=out_A1.reshape(ny, nx),
+        mu1=out_mu1.reshape(ny, nx, D),
+        cov1=out_cov1.reshape(ny, nx, D, D),
+        A2=out_A2.reshape(ny, nx),
+        mu2=out_mu2.reshape(ny, nx, D),
+        cov2=out_cov2.reshape(ny, nx, D, D),
+        c=out_c.reshape(ny, nx),
+        n_peaks=out_n.reshape(ny, nx),
+        bic1=out_b1.reshape(ny, nx),
+        bic2=out_b2.reshape(ny, nx),
+        success=out_s.reshape(ny, nx),
+    )
