@@ -1,8 +1,8 @@
 """ID03 scan readers.
 
 Readers return data as (a, b, m[, n]) uint16 with detector dimensions first,
-and motors (k, m[, n]). Snake/zigzag scans are re-sorted onto a monotonically
-increasing motor grid.
+and motors (k, m[, n]) as float64. Snake/zigzag scans are re-sorted onto a
+monotonically increasing motor grid.
 
 For 2-D ``fscan2d`` scans (the strain-sweep, mosaicity and 3-D strain-mosa
 acquisitions) the frames are kept in acquisition order — outer/slow motor on
@@ -12,14 +12,32 @@ sorted by the slow motor. Because the rows come from acquisition order rather
 than from sorting the slow-motor values, this is immune to slow-motor encoder
 jitter that a plain lexicographic ``(slow, fast)`` value-sort would otherwise
 mistake for the fast-axis order. This mirrors the partial-scan loader exactly.
+
+Read path: the frame order is computed from the motor datasets *before* any
+frame is read, the final detector-first array is allocated once, and slabs of
+frames are placed into it (transposed, re-sort folded into the placement) as
+they are decompressed. There is no reshape/swapaxes/contiguous-copy pass and
+no separate resort pass, so peak memory is the final array plus one slab.
+With ``n_workers`` (or automatically for large scans) the slabs are read by
+worker processes into shared memory — libhdf5 holds one process-global lock,
+so threads cannot parallelise decompression, but processes can (see
+``starling.io._mpread``).
 """
 
+import os
 import warnings
 
 import h5py
 import numpy as np
 
 from ._metadata import ID03
+
+# target bytes per read slab (serial and per worker); chunks align to whole
+# fast-axis rows so the snake re-sort stays local to one slab
+_SLAB_BYTES = 192 * 2**20
+# auto-enable the multiprocess read engine above this stack size
+_MP_MIN_BYTES = int(os.environ.get("STARLING_MP_MIN_BYTES", 2 * 2**30))
+_MP_MAX_AUTO_WORKERS = 8
 
 
 def _ascontiguousarrays(data, motors):
@@ -66,16 +84,168 @@ def _warn_if_not_separable(motors, scan_id, tol_frac=0.25):
         )
 
 
+# --------------------------------------------------------------------------- #
+# frame-order permutations (computed from motors only, before any frame read)
+# --------------------------------------------------------------------------- #
+
+
+def _snake_perm(motors):
+    """Frame permutation + sorted motor grid for an fscan2d acquisition.
+
+    Sorts each slow row onto a monotonic fast grid (de-zigzagging a snake
+    scan), then the rows by the slow motor — without sorting the slow values
+    inside a row, so slow-motor encoder jitter cannot scramble the grid.
+
+    Args:
+        motors: (2, m, n) float [slow, fast] values in acquisition order.
+
+    Returns:
+        tuple: perm (m*n,) int64 with ``sorted_flat[k] = acquired_flat[perm[k]]``,
+        and motors (2, m, n) float64 on the sorted grid.
+    """
+    slow = np.asarray(motors[0], dtype=np.float64).copy()
+    fast = np.asarray(motors[1], dtype=np.float64).copy()
+    m, n = slow.shape
+    # sort keys go through float32 so the frame order stays bit-compatible
+    # with the legacy loader (which stored motors as float32); only the
+    # *stored* motors were upgraded to float64
+    fast_key = fast.astype(np.float32)
+    src = np.arange(m * n, dtype=np.int64).reshape(m, n)
+    for r in range(m):
+        order = np.argsort(fast_key[r], kind="stable")
+        src[r] = src[r, order]
+        fast[r] = fast[r, order]
+        slow[r] = slow[r, order]
+    row_order = np.argsort(slow[:, 0].astype(np.float32), kind="stable")
+    perm = src[row_order].reshape(-1)
+    motors_sorted = np.stack([slow[row_order], fast[row_order]])
+    return perm, motors_sorted
+
+
+def _value_perm(motors):
+    """Legacy lexicographic ``(motor1, motor2)`` value sort as a permutation.
+
+    Args:
+        motors: (2, m, n) float motor values in acquisition order.
+
+    Returns:
+        tuple: perm (m*n,) int64, motors (2, m, n) float64 sorted.
+    """
+    shape = np.asarray(motors[0]).shape
+    m1 = np.asarray(motors[0], dtype=np.float64).reshape(-1)
+    m2 = np.asarray(motors[1], dtype=np.float64).reshape(-1)
+    # float32 sort keys: bit-compatible frame order with the legacy loader
+    # (see _snake_perm); stored motors stay float64
+    s = np.empty(m1.size, dtype=[("m1", "f8"), ("m2", "f8")])
+    s["m1"], s["m2"] = m1.astype(np.float32), m2.astype(np.float32)
+    perm = np.argsort(s, order=["m1", "m2"]).astype(np.int64)
+    motors_sorted = np.stack([m1[perm].reshape(shape), m2[perm].reshape(shape)])
+    return perm, motors_sorted
+
+
+# --------------------------------------------------------------------------- #
+# placement read: frames go straight into the final detector-first layout
+# --------------------------------------------------------------------------- #
+
+
+def _roi_slices(roi):
+    if roi:
+        r1, r2, c1, c2 = roi
+        return slice(r1, r2), slice(c1, c2)
+    return slice(None), slice(None)
+
+
+def _roi_extent(dset_shape, roi):
+    rsel, csel = _roi_slices(roi)
+    rows = len(range(*rsel.indices(dset_shape[1])))
+    cols = len(range(*csel.indices(dset_shape[2])))
+    return rows, cols
+
+
+def _frames_per_chunk(n_frames, frame_bytes, row_len=None):
+    """Frames per read slab: ~_SLAB_BYTES, at most ~1/8 of the stack (so peak
+    memory stays close to the final array), aligned to whole fast-axis rows."""
+    total = n_frames * frame_bytes
+    target = min(_SLAB_BYTES, max(frame_bytes, total // 8))
+    k = max(1, int(target // frame_bytes))
+    if row_len:
+        k = max(row_len, (k // row_len) * row_len)
+    return min(k, n_frames)
+
+
+def _dest_chunks(n_frames, frames_per_chunk):
+    return [
+        (lo, min(lo + frames_per_chunk, n_frames))
+        for lo in range(0, n_frames, frames_per_chunk)
+    ]
+
+
+def _place_frames(dset, out_flat, perm, roi, lo, hi):
+    """Read the source frames for destination range [lo, hi) and place them
+    detector-first: ``out_flat[a, b, k] = frame(perm[k])`` (``frame(k)`` when
+    perm is None). The re-sort is folded into the placement — one strided
+    write, no global transpose pass, no separate resort pass.
+
+    Reads one contiguous frame span when the permutation is block-local (snake
+    rows, jittered sweeps — the common case), else an increasing h5py point
+    selection.
+    """
+    rsel, csel = _roi_slices(roi)
+    if perm is None:
+        slab = dset[lo:hi, rsel, csel]
+    else:
+        src = np.asarray(perm[lo:hi])
+        smin = int(src.min())
+        smax = int(src.max()) + 1
+        if smax - smin == hi - lo and np.array_equal(
+            src, np.arange(smin, smax, dtype=src.dtype)
+        ):
+            slab = dset[smin:smax, rsel, csel]
+        elif smax - smin <= 4 * (hi - lo):
+            slab = dset[smin:smax, rsel, csel]
+            slab = slab[src - smin]
+        else:
+            order = np.argsort(src, kind="stable")
+            slab_sorted = dset[src[order], rsel, csel]  # h5py wants increasing
+            slab = np.empty_like(slab_sorted)
+            slab[order] = slab_sorted
+    out_flat[..., lo:hi] = np.moveaxis(slab, 0, -1)
+
+
+def _resolve_workers(n_workers, stack_bytes, n_frames):
+    """Number of read processes; 0 means the serial in-process path.
+
+    ``None`` auto-enables above _MP_MIN_BYTES (override with the
+    STARLING_MP_MIN_BYTES env var); an explicit value always wins.
+    """
+    if n_workers is not None:
+        n = int(n_workers)
+        return 0 if n < 2 else min(n, n_frames)
+    if stack_bytes < _MP_MIN_BYTES:
+        return 0
+    n = min(_MP_MAX_AUTO_WORKERS, os.cpu_count() or 1, n_frames)
+    return 0 if n < 2 else n
+
+
 class Reader:
     """Base reader. Subclass and implement __call__ for custom acquisition
     schemes; anything returning (data, motors) in the standard layout plugs
-    into starling.DataSet."""
+    into starling.DataSet.
 
-    def __init__(self, abs_path_to_h5_file):
+    Args:
+        abs_path_to_h5_file (str): BLISS master file path.
+        n_workers: read-process count. None auto-enables multiprocess reads
+            for large scans; 0/1 forces the serial path; >= 2 forces that many
+            worker processes. Any parallel-read failure falls back to the
+            serial path with a warning.
+    """
+
+    def __init__(self, abs_path_to_h5_file, n_workers=None):
         self.abs_path_to_h5_file = abs_path_to_h5_file
         self.config = ID03(abs_path_to_h5_file)
         self.scan_params = None
         self.sensors = None
+        self.n_workers = n_workers
 
     def fetch(self, key):
         """Read an arbitrary h5 path (exotic motors, extra metadata)."""
@@ -83,8 +253,10 @@ class Reader:
             return h5file[key][...]
 
     def _read_stack(self, h5f, scan_id, roi):
-        """Read the image stack, reshaped to (*scan_shape, rows, cols) and
-        then transposed to detector-first layout."""
+        """Legacy helper (kept for custom subclasses): read the image stack,
+        reshaped to (*scan_shape, rows, cols) and then transposed to
+        detector-first layout. The built-in readers use :meth:`_read_placed`,
+        which avoids this transpose copy."""
         if roi:
             r1, r2, c1, c2 = roi
             data = h5f[scan_id][self.scan_params["data_name"]][:, r1:r2, c1:c2]
@@ -97,6 +269,83 @@ class Reader:
         data = data.swapaxes(1, -1)
         return data
 
+    # ---------------- shared metadata/read machinery ---------------- #
+
+    def _read_motors(self, h5f, scan_id, scan_params):
+        """Per-frame motor values, (n_motors, *scan_shape) float64."""
+        scan_shape = tuple(int(s) for s in scan_params["scan_shape"])
+        return np.array(
+            [
+                np.asarray(h5f[scan_id][mn][...], dtype=np.float64).reshape(scan_shape)
+                for mn in scan_params["motor_names"]
+            ]
+        )
+
+    def _prepare(self, h5f, scan_id):
+        """Resolve everything needed to read a scan, from one open handle.
+
+        Returns:
+            tuple: (scan_params, sensors, perm, motors, row_len) where perm is
+            the frame placement order (None = acquisition order), motors the
+            sorted motor grid and row_len the fast-axis length (or None).
+        """
+        raise NotImplementedError
+
+    def _read_placed(self, h5f, scan_id, scan_params, roi, perm, out=None,
+                     row_len=None):
+        """Serial placement read into ``out`` (allocated here unless given —
+        the stacked loader passes a strided view of the scan cube)."""
+        dset = h5f[scan_id][scan_params["data_name"]]
+        n_frames = dset.shape[0]
+        rows, cols = _roi_extent(dset.shape, roi)
+        scan_shape = tuple(int(s) for s in scan_params["scan_shape"])
+        if out is None:
+            out = np.empty((rows, cols, *scan_shape), dtype=dset.dtype)
+        out_flat = out.reshape(rows, cols, n_frames)
+        if not np.may_share_memory(out_flat, out):  # must be a view, never a copy
+            raise ValueError("output array is not reshapeable to (rows, cols, -1)")
+        fpc = _frames_per_chunk(n_frames, rows * cols * dset.dtype.itemsize, row_len)
+        for lo, hi in _dest_chunks(n_frames, fpc):
+            _place_frames(dset, out_flat, perm, roi, lo, hi)
+        return out
+
+    def _dispatch_read(self, h5f, scan_id, scan_params, roi, perm, row_len=None):
+        """Read via the multiprocess engine when enabled, else serially.
+
+        Any parallel-read failure (shared-memory setup, worker crash) warns
+        and falls back to the serial path.
+        """
+        dset = h5f[scan_id][scan_params["data_name"]]
+        n_frames = dset.shape[0]
+        rows, cols = _roi_extent(dset.shape, roi)
+        stack_bytes = n_frames * rows * cols * dset.dtype.itemsize
+        n_workers = _resolve_workers(self.n_workers, stack_bytes, n_frames)
+        if n_workers >= 2:
+            from . import _mpread
+
+            scan_shape = tuple(int(s) for s in scan_params["scan_shape"])
+            try:
+                return _mpread.read_scan_shm(
+                    self.abs_path_to_h5_file,
+                    scan_id,
+                    scan_params["data_name"],
+                    (rows, cols, *scan_shape),
+                    dset.dtype,
+                    roi,
+                    perm,
+                    n_workers,
+                    row_len=row_len,
+                )
+            except Exception as exc:
+                warnings.warn(
+                    f"scan {scan_id}: parallel read failed ({exc!r}); falling "
+                    f"back to the serial reader.",
+                    stacklevel=3,
+                )
+        return self._read_placed(
+            h5f, scan_id, scan_params, roi, perm, row_len=row_len
+        )
+
     def __call__(self, scan_id, roi=None):
         raise NotImplementedError
 
@@ -104,93 +353,82 @@ class Reader:
 class MosaScan(Reader):
     """2D scan (e.g. fscan2d chi x mu): data (a, b, m, n), motors (2, m, n)."""
 
-    def __call__(self, scan_id, roi=None):
-        self.scan_params, self.sensors = self.config(scan_id)
-
-        with h5py.File(self.abs_path_to_h5_file, "r") as h5f:
-            motors = [
-                h5f[scan_id][mn][...].reshape(*self.scan_params["scan_shape"])
-                for mn in self.scan_params["motor_names"]
-            ]
-            motors = np.array(motors).astype(np.float32)
-            data = self._read_stack(h5f, scan_id, roi)
-
-        command = self.scan_params["scan_command"].split()[0]
+    def _prepare(self, h5f, scan_id):
+        scan_params, sensors = self.config(scan_id, h5f=h5f)
+        motors = self._read_motors(h5f, scan_id, scan_params)
+        command = scan_params["scan_command"].split()[0]
         if command == "fscan2d":
             # acquisition order: axis -2 = slow (outer) levels, axis -1 = fast
             # (inner) sweep. Jitter-immune (rows come from acquisition order).
-            data, motors = self._resort_snake_by_acquisition(data, motors)
+            perm, motors = _snake_perm(motors)
         else:
             # arbitrary 2-D acquisition (e.g. amesh): fall back to a lexicographic
             # value sort, which does not assume acquisition order.
-            data, motors = self._resort_by_value(data, motors)
+            perm, motors = _value_perm(motors)
+        row_len = int(scan_params["scan_shape"][-1])
+        return scan_params, sensors, perm, motors, row_len
 
+    def __call__(self, scan_id, roi=None):
+        with h5py.File(self.abs_path_to_h5_file, "r") as h5f:
+            scan_params, sensors, perm, motors, row_len = self._prepare(h5f, scan_id)
+            self.scan_params, self.sensors = scan_params, sensors
+            data = self._dispatch_read(
+                h5f, scan_id, scan_params, roi, perm, row_len=row_len
+            )
         _warn_if_not_separable(motors, scan_id)
         return _ascontiguousarrays(data, motors)
 
     @staticmethod
     def _resort_snake_by_acquisition(data, motors):
         """Sort each slow row onto a monotonic fast grid, then rows by the slow
-        motor — de-zigzagging a snake scan without sorting the slow values."""
-        data = np.ascontiguousarray(data)
+        motor — de-zigzagging a snake scan without sorting the slow values.
+
+        In-memory variant of the permutation the reader applies at placement
+        time (kept for diagnostics and tests). Does not mutate its inputs.
+        """
+        perm, motors_sorted = _snake_perm(motors)
         a, b, m, n = data.shape
-        slow = motors[0].astype(np.float32).copy()
-        fast = motors[1].astype(np.float32).copy()
-        for r in range(m):
-            order = np.argsort(fast[r], kind="stable")
-            data[:, :, r, :] = data[:, :, r, order]
-            fast[r] = fast[r, order]
-            slow[r] = slow[r, order]
-        row_order = np.argsort(slow[:, 0], kind="stable")
-        data = data[:, :, row_order, :]
-        motors = np.stack([slow[row_order], fast[row_order]])
-        return data, motors
+        data = data.reshape(a, b, m * n)[..., perm].reshape(a, b, m, n)
+        return data, motors_sorted
 
     @staticmethod
     def _resort_by_value(data, motors):
         """Legacy lexicographic ``(motor1, motor2)`` value sort."""
-        s = np.array(
-            list(zip(motors[0].flatten(), motors[1].flatten())),
-            dtype=[("m1", "f8"), ("m2", "f8")],
-        )
-        frame_indices = np.argsort(s, order=["m1", "m2"])
+        perm, motors_sorted = _value_perm(motors)
         a, b, m, n = data.shape
-        data = data.reshape(a, b, m * n)[..., frame_indices].reshape(a, b, m, n)
-        motors = motors.copy()
-        motors[0, :] = motors[0, :].flatten()[frame_indices].reshape(m, n)
-        motors[1, :] = motors[1, :].flatten()[frame_indices].reshape(m, n)
-        return data, motors
+        data = data.reshape(a, b, m * n)[..., perm].reshape(a, b, m, n)
+        return data, motors_sorted
 
 
 class RockingScan(Reader):
     """1D scan (e.g. fscan mu): data (a, b, m), motors (1, m)."""
 
+    def _prepare(self, h5f, scan_id):
+        scan_params, sensors = self.config(scan_id, h5f=h5f)
+        motors = self._read_motors(h5f, scan_id, scan_params)
+        # float32 sort key: bit-compatible frame order with the legacy loader
+        perm = np.argsort(motors[0].reshape(-1).astype(np.float32)).astype(np.int64)
+        motors = motors[:, perm]
+        return scan_params, sensors, perm, motors, None
+
     def __call__(self, scan_id, roi=None):
-        self.scan_params, self.sensors = self.config(scan_id)
-
         with h5py.File(self.abs_path_to_h5_file, "r") as h5f:
-            motors = [
-                h5f[scan_id][mn][...].reshape(*self.scan_params["scan_shape"])
-                for mn in self.scan_params["motor_names"]
-            ]
-            motors = np.array(motors).astype(np.float32)
-            data = self._read_stack(h5f, scan_id, roi)
-
-        frame_indices = np.argsort(motors[0].flatten())
-        data = data[..., frame_indices]
-        motors[0, :] = motors[0, frame_indices]
-
+            scan_params, sensors, perm, motors, _ = self._prepare(h5f, scan_id)
+            self.scan_params, self.sensors = scan_params, sensors
+            data = self._dispatch_read(h5f, scan_id, scan_params, roi, perm)
         return _ascontiguousarrays(data, motors)
 
 
 class Darks(Reader):
     """Motorless image series (loopscan darks): data (a, b, m), empty motors."""
 
+    def _prepare(self, h5f, scan_id):
+        scan_params, sensors = self.config(scan_id, h5f=h5f)
+        return scan_params, sensors, None, np.array([], dtype=np.float64), None
+
     def __call__(self, scan_id, roi=None):
-        self.scan_params, self.sensors = self.config(scan_id)
-
         with h5py.File(self.abs_path_to_h5_file, "r") as h5f:
-            motors = np.array([], dtype=np.float32)
-            data = self._read_stack(h5f, scan_id, roi)
-
+            scan_params, sensors, perm, motors, _ = self._prepare(h5f, scan_id)
+            self.scan_params, self.sensors = scan_params, sensors
+            data = self._dispatch_read(h5f, scan_id, scan_params, roi, perm)
         return _ascontiguousarrays(data, motors)

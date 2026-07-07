@@ -109,34 +109,43 @@ class ID03:
             "elapsed_time": "instrument/elapsed_time/value",
         }
 
-    def __call__(self, scan_id):
+    def __call__(self, scan_id, h5f=None):
         """Parse all scan parameters and sensor data for a scan id.
+
+        All metadata (title parse, motor resolution, detector discovery,
+        invariant motors, sensors) is served from a single ``h5py.File``
+        open — repeated open/close cycles are an NFS/GPFS latency bomb on
+        beamline filesystems. Pass an already-open ``h5f`` handle to fold
+        this call into an enclosing open (e.g. a stacked-scan metadata pass).
 
         Returns:
             tuple: scan_params dict (scan_command, scan_shape, motor_names,
             integrated_motors, data_name, scan_id, invariant_motors) and a
             sensors dict.
         """
+        if h5f is None:
+            with h5py.File(self.abs_path_to_h5_file, "r") as h5f:
+                return self(scan_id, h5f=h5f)
+
         scan_params = {}
-        scan_params["scan_command"] = self._get_scan_command(scan_id)
+        scan_params["scan_command"] = self._get_scan_command(scan_id, h5f)
         scan_params["scan_shape"] = self._get_scan_shape(scan_params)
         scan_params["motor_names"] = self._get_motor_names(
-            scan_params, scan_id, scan_params["scan_shape"]
+            scan_params, scan_id, scan_params["scan_shape"], h5f
         )
         scan_params["integrated_motors"] = self._get_integrated_motors(scan_params)
         scan_params["data_name"] = self._get_data_name(
-            scan_id, scan_params["scan_shape"]
+            scan_id, scan_params["scan_shape"], h5f
         )
         scan_params["scan_id"] = scan_id
         scan_params["invariant_motors"] = self._get_invariant_motors(
-            scan_params["motor_names"], scan_id
+            scan_params["motor_names"], scan_id, h5f
         )
-        sensors = self._get_sensor_data(scan_id)
+        sensors = self._get_sensor_data(scan_id, h5f)
         return scan_params, sensors
 
-    def _get_scan_command(self, scan_id):
-        with h5py.File(self.abs_path_to_h5_file, "r") as h5f:
-            return h5f[scan_id]["title"][()].decode("utf-8")
+    def _get_scan_command(self, scan_id, h5f):
+        return h5f[scan_id]["title"][()].decode("utf-8")
 
     def _get_scan_shape(self, scan_params):
         command = scan_params["scan_command"].split(" ")[0]
@@ -147,7 +156,7 @@ class ID03:
             scan_shape = scan_shape + 1
         return scan_shape
 
-    def _get_motor_names(self, scan_params, scan_id, scan_shape):
+    def _get_motor_names(self, scan_params, scan_id, scan_shape, h5f):
         command = scan_params["scan_command"].split(" ")[0]
         params = scan_params["scan_command"].split(" ")[1:]
 
@@ -161,65 +170,72 @@ class ID03:
         motor_names = []
         expected_number_of_frames = np.prod(scan_shape)
 
-        with h5py.File(self.abs_path_to_h5_file, "r") as h5f:
-            for motor_name in trial_motor_names:
-                fallback = self.fallback_motor_map.get(motor_name)
-                if (
-                    motor_name in h5f[scan_id]
-                    and h5f[scan_id][motor_name].size == expected_number_of_frames
-                ):
-                    motor_names.append(motor_name)
-                elif (
-                    fallback is not None
-                    and fallback in h5f[scan_id]
-                    and h5f[scan_id][fallback].size == expected_number_of_frames
-                ):
-                    motor_names.append(fallback)
-                else:
-                    raise ValueError(
-                        f"Could not find {motor_name} with fallback name {fallback}"
-                    )
+        scan_group = h5f[scan_id]
+        for motor_name in trial_motor_names:
+            fallback = self.fallback_motor_map.get(motor_name)
+            if (
+                motor_name in scan_group
+                and scan_group[motor_name].size == expected_number_of_frames
+            ):
+                motor_names.append(motor_name)
+            elif (
+                fallback is not None
+                and fallback in scan_group
+                and scan_group[fallback].size == expected_number_of_frames
+            ):
+                motor_names.append(fallback)
+            else:
+                raise ValueError(
+                    f"Could not find {motor_name} with fallback name {fallback}"
+                )
         return motor_names
 
     def _get_integrated_motors(self, scan_params):
         command = scan_params["scan_command"].split(" ")[0]
         return self.is_integrated[command]
 
-    def _get_invariant_motors(self, moving_motor_names, scan_id):
+    def _get_invariant_motors(self, moving_motor_names, scan_id, h5f):
         invariant_motors = {}
-        with h5py.File(self.abs_path_to_h5_file, "r") as h5f:
-            for motor_key, h5_motor_path in self.motor_map.items():
-                if moving_motor_names is None or h5_motor_path not in moving_motor_names:
-                    fallback = self.fallback_motor_map.get(h5_motor_path)
-                    if h5_motor_path in h5f[scan_id]:
-                        invariant_motors[motor_key] = h5f[scan_id][h5_motor_path][()]
-                    elif fallback is not None and fallback in h5f[scan_id]:
-                        invariant_motors[motor_key] = h5f[scan_id][fallback][()]
+        scan_group = h5f[scan_id]
+        for motor_key, h5_motor_path in self.motor_map.items():
+            if moving_motor_names is None or h5_motor_path not in moving_motor_names:
+                fallback = self.fallback_motor_map.get(h5_motor_path)
+                if h5_motor_path in scan_group:
+                    invariant_motors[motor_key] = scan_group[h5_motor_path][()]
+                elif fallback is not None and fallback in scan_group:
+                    invariant_motors[motor_key] = scan_group[fallback][()]
         return invariant_motors
 
-    def _get_sensor_data(self, scan_id):
+    def _get_sensor_data(self, scan_id, h5f):
         sensor_scan_id = scan_id.split(".")[0] + ".2"
         sensors = {}
-        with h5py.File(self.abs_path_to_h5_file, "r") as h5f:
-            for sensor_name, h5_sensor_path in self.sensor_names.items():
-                if sensor_scan_id in h5f and h5_sensor_path in h5f[sensor_scan_id]:
-                    sensors[sensor_name] = h5f[sensor_scan_id][h5_sensor_path][()]
-                else:
-                    sensors[sensor_name] = None
+        sensor_group = h5f[sensor_scan_id] if sensor_scan_id in h5f else None
+        for sensor_name, h5_sensor_path in self.sensor_names.items():
+            if sensor_group is not None and h5_sensor_path in sensor_group:
+                sensors[sensor_name] = sensor_group[h5_sensor_path][()]
+            else:
+                sensors[sensor_name] = None
         return sensors
 
-    def _get_data_name(self, scan_id, scan_shape):
+    def _get_data_name(self, scan_id, scan_shape, h5f):
         """The h5 key of the detector image stack: the 3D dataset whose first
         dimension matches the total number of scan points."""
-        leafs = []
-        with h5py.File(self.abs_path_to_h5_file, "r") as h5f:
-            h5f[scan_id].visititems(lambda name, obj: leafs.append(name))
-            while leafs:
-                leaf = leafs.pop()
-                if (
-                    isinstance(h5f[scan_id][leaf], h5py.Dataset)
-                    and len(h5f[scan_id][leaf].shape) == 3
-                    and h5f[scan_id][leaf].shape[0] == np.prod(scan_shape)
-                ):
-                    return leaf
+        n_expected = np.prod(scan_shape)
+        matches = []
+
+        def visit(name, obj):
+            # test on the visited object itself: re-opening h5f[scan_id][name]
+            # per leaf churns hundreds of h5py object constructions per scan
+            if (
+                isinstance(obj, h5py.Dataset)
+                and len(obj.shape) == 3
+                and obj.shape[0] == n_expected
+            ):
+                matches.append(name)
+
+        h5f[scan_id].visititems(visit)
+        if matches:
+            # the legacy scan popped leafs from the end of the visit list, so
+            # keep returning the last visited match
+            return matches[-1]
         raise ValueError("No dataset found in h5 file")
