@@ -107,7 +107,7 @@ def edge_peak_mask(data, edge_bins=3, axes=None):
 
 
 def classify_fit_status(mu, success, motor_ranges, motor_steps, mask=None,
-                        edge_tol_steps=1.0, axes=None, data_edge=None):
+                        edge_tol_steps=1.0, axes=None, data_edge=None, A=None):
     """Per-pixel fit status: 0 no-signal / 1 ok / 2 edge-clipped / 3 failed.
 
     Two complementary edge criteria feed EDGE_CLIPPED:
@@ -135,6 +135,10 @@ def classify_fit_status(mu, success, motor_ranges, motor_steps, mask=None,
         data_edge (numpy.ndarray, optional): (ny, nx) bool from
             :func:`edge_peak_mask`; reclassifies failed/diverged pixels whose
             raw profile peaks at the scan edge as EDGE_CLIPPED.
+        A (numpy.ndarray, optional): (ny, nx) fitted amplitudes. A pixel with
+            a non-positive or non-finite amplitude is never OK — a degenerate
+            "background-only" or negative-dip solution can converge with an
+            in-window centre and would otherwise masquerade as a good fit.
 
     Returns:
         numpy.ndarray: (ny, nx) int8 status map.
@@ -154,6 +158,9 @@ def classify_fit_status(mu, success, motor_ranges, motor_steps, mask=None,
         )
 
     converged = np.asarray(success) > 0.5
+    if A is not None:
+        Aa = np.asarray(A)
+        converged = converged & (Aa > 0) & np.isfinite(Aa)
     near_edge = np.zeros((ny, nx), dtype=bool)
     out_of_bounds = np.zeros((ny, nx), dtype=bool)
     for (lo, hi), step, ax in zip(motor_ranges, motor_steps, axes):

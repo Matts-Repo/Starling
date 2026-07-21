@@ -704,6 +704,17 @@ class DataSet:
             edge_tol_steps=edge_tol_steps,
             axes=axes,
             data_edge=data_edge,
+            A=getattr(result, "A", None),
+        )
+
+    def refit_edge_clipped(self, result, status, cov=None, **kw):
+        """Constrained refit of edge-clipped/failed pixels (fixed grain-median
+        covariance). Returns ``(merged_result, refit_mask)``; ``status`` stays
+        unchanged — refit values are flagged estimates, not free measurements.
+        See :func:`starling.properties.refit_edge_pixels`."""
+        return properties.refit_edge_pixels(
+            self.data, self.motors, result, status, cov=cov,
+            device=self.device, **kw,
         )
 
     def mosaicity(self, mode="scalar", axes=None, source="fit", mask="auto"):
