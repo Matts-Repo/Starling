@@ -144,7 +144,8 @@ def fit_1D_pseudo_voigt(data, coordinates, n_iter_gauss_newton=10, mask=None, de
     Args:
         data (numpy.ndarray): shape (ny, nx, m).
         coordinates: length-1 sequence holding the (m,) motor coordinate array.
-        n_iter_gauss_newton (int): Gauss-Newton iterations. Defaults to 10.
+        n_iter_gauss_newton (int): maximum Gauss-Newton iterations (pixels
+            stop early once converged to ``xtol``). Defaults to 10.
         mask (numpy.ndarray): optional (ny, nx) bool; only True pixels are fit.
         device: torch device or name; None auto-detects.
 
@@ -449,7 +450,7 @@ def _safe_chol_lower(M):
 
 
 def _fit_ND_engine(data, coordinates, n_iter_gauss_newton, mask, device,
-                   lam=1e-1, adaptive=True, progress=True):
+                   lam=1e-1, adaptive=True, progress=True, xtol=1e-5):
     """Core N-D Gaussian + constant-background fit; returns a dict of maps.
 
     Generalises the 2D mosa fit to arbitrary D. The inverse covariance is
@@ -561,8 +562,14 @@ def _fit_ND_engine(data, coordinates, n_iter_gauss_newton, mask, device,
         )
         p0 = torch.as_tensor(seed, dtype=dtype, device=dev)
 
+        # hopeless-pixel freeze: whitened centres live in ~[-1.5, 1.5] for
+        # any peak in/near the scan window; a centre beyond 8 whitened units
+        # is a runaway (truncated-peak divergence) that would otherwise keep
+        # the whole chunk iterating. Per-pixel -> batch-invariant.
+        _esc = lambda p: (p[:, 1:1 + D].abs() > 8.0).any(-1)
         params, ok = gauss_newton_batched(
-            yn, ch, p0, model, n_iter=n_iter_gauss_newton, lam=lam, adaptive=adaptive
+            yn, ch, p0, model, n_iter=n_iter_gauss_newton, lam=lam,
+            adaptive=adaptive, xtol=xtol, freeze_fn=_esc,
         )
         ok = ok & ~degenerate
 
@@ -614,7 +621,7 @@ def _fit_ND_engine(data, coordinates, n_iter_gauss_newton, mask, device,
 
 
 def fit_ND_gaussian(data, coordinates, n_iter_gauss_newton=10, mask=None, device=None,
-                    lam=1e-1, adaptive=True, progress=True):
+                    lam=1e-1, adaptive=True, progress=True, xtol=1e-5):
     """Fit an N-D Gaussian + constant background per pixel (batched on GPU).
 
     A single per-pixel Gaussian fit in an arbitrary number of motor dimensions
@@ -637,7 +644,7 @@ def fit_ND_gaussian(data, coordinates, n_iter_gauss_newton=10, mask=None, device
     """
     maps = _fit_ND_engine(
         data, coordinates, n_iter_gauss_newton, mask, device,
-        lam=lam, adaptive=adaptive, progress=progress,
+        lam=lam, adaptive=adaptive, progress=progress, xtol=xtol,
     )
     return GaussNDResult(**maps)
 
