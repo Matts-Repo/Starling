@@ -365,6 +365,26 @@ class DataSet:
             raise ValueError("No data has been loaded, use load_scan() to load data.")
         return self.reader.sensors
 
+    @property
+    def pixel_size_um(self):
+        """Effective (sample-plane) pixel size in micrometres.
+
+        Computed once from the scan's invariant obx/mainx/obpitch motors via
+        :func:`starling.io.effective_pixel_size`; falls back to the nominal
+        6.5 um sensor pitch (with a warning) when the geometry is missing.
+        """
+        cached = getattr(self, "_pixel_size_um", None)
+        if cached is not None:
+            return cached
+        from ._geometry import effective_pixel_size
+
+        try:
+            invariant = self.scan_params.get("invariant_motors", {})
+        except Exception:
+            invariant = {}
+        self._pixel_size_um = effective_pixel_size(invariant)
+        return self._pixel_size_um
+
     def info(self):
         if self.data is not None:
             for k in self.scan_params:
@@ -391,6 +411,11 @@ class DataSet:
     def subtract(self, background):
         preprocess.subtract(self.data, background)
 
+    def threshold_removal(self, bottom=None, top=None):
+        """Optional darfix-parity hard threshold; see
+        :func:`starling.preprocess.threshold_removal`. Off unless called."""
+        preprocess.threshold_removal(self.data, bottom=bottom, top=top)
+
     def remove_hot_pixels(
         self,
         n_sigma=5.0,
@@ -415,12 +440,43 @@ class DataSet:
         )
 
     def auto_roi(self, threshold_rel=0.05, pad=20, apply=True):
-        """Find (and by default crop to) the grain bounding box."""
+        """Find (and by default crop to) the grain bounding box.
+
+        When applied, the crop box is recorded (composed with any previous
+        auto-crop) so :meth:`final_roi` can reconstruct the absolute detector
+        ROI of ``self.data`` for raw re-reads.
+        """
         roi = preprocess.auto_roi(self.data, threshold_rel=threshold_rel, pad=pad)
         if apply:
             r1, r2, c1, c2 = roi
             self.data = np.ascontiguousarray(self.data[r1:r2, c1:c2])
+            prev = getattr(self, "_auto_roi", None)
+            if prev is None:
+                self._auto_roi = (r1, r2, c1, c2)
+            else:
+                pr1, _pr2, pc1, _pc2 = prev
+                self._auto_roi = (pr1 + r1, pr1 + r2, pc1 + c1, pc1 + c2)
         return roi
+
+    def final_roi(self):
+        """Absolute detector ROI of the current ``self.data``.
+
+        Composes the load-time ``roi`` with any applied :meth:`auto_roi`
+        crop(s), in absolute detector coordinates.
+
+        Returns:
+            tuple: (row_min, row_max, col_min, col_max), or ``None`` when the
+            full detector was loaded and never auto-cropped.
+        """
+        load_roi = self.roi
+        auto = getattr(self, "_auto_roi", None)
+        if auto is None:
+            return tuple(load_roi) if load_roi is not None else None
+        ar1, ar2, ac1, ac2 = auto
+        if load_roi is None:
+            return (ar1, ar2, ac1, ac2)
+        lr1, _lr2, lc1, _lc2 = load_roi
+        return (lr1 + ar1, lr1 + ar2, lc1 + ac1, lc1 + ac2)
 
     # ------------------------------------------------------------------ #
     # analysis (GPU)
@@ -608,6 +664,48 @@ class DataSet:
             f"'gauss2p', 'gaussND', 'gaussND2' or 'pv'"
         )
 
+    def fit_status(self, result, mask="auto", edge_tol_steps=1.0, axes=None,
+                   edge_bins=3):
+        """Categorical per-pixel fit status for a fitted result.
+
+        0 = no signal (outside ``mask``), 1 = ok, 2 = edge-clipped (peak
+        truncated by the scanned range — detected from the fitted centre
+        and/or the raw profile's argmax at a range edge), 3 = failed. See
+        :func:`starling.properties.classify_fit_status`.
+
+        Args:
+            result: a fit result with ``.mu`` and ``.success`` (e.g.
+                :class:`~starling.properties.Gauss1DResult` /
+                :class:`~starling.properties.GaussNDResult`).
+            mask: "auto" (grain mask), None, or a bool array — must match the
+                mask the fit was run with for NO_SIGNAL to be meaningful.
+            edge_tol_steps (float): edge band width in motor grid steps.
+            axes: subset of motor axes to check (default all).
+            edge_bins (int): data-driven truncation test — a failed pixel
+                whose raw profile argmax lies within this many grid points of
+                a scan edge is EDGE_CLIPPED, not FAILED. 0 disables.
+
+        Returns:
+            numpy.ndarray: (ny, nx) int8 status map.
+        """
+        m = self._resolve_mask(mask)
+        ranges, steps = properties.motor_ranges_steps(self.motors, axes=axes)
+        data_edge = (
+            properties.edge_peak_mask(self.data, edge_bins=edge_bins, axes=axes)
+            if edge_bins
+            else None
+        )
+        return properties.classify_fit_status(
+            result.mu,
+            result.success,
+            ranges,
+            steps,
+            mask=m,
+            edge_tol_steps=edge_tol_steps,
+            axes=axes,
+            data_edge=data_edge,
+        )
+
     def mosaicity(self, mode="scalar", axes=None, source="fit", mask="auto"):
         """Orientation-spread (mosaicity) map; from the fit (default) or moments.
 
@@ -624,7 +722,24 @@ class DataSet:
         """Mean-orientation (centre-of-mass) map for the chosen motor axes."""
         m = self._resolve_mask(mask)
         mean, _ = self.moments(mask=m)
-        return properties.orientation_map(mean, axes=axes, norm=norm, as_rgb=as_rgb)
+        return properties.orientation_map(
+            mean, axes=axes, norm=norm, as_rgb=as_rgb, mask=m
+        )
+
+    def orientation_stamp(self, axes=(0, 1), vrange=None, colormap_name="hsv",
+                          sat=40, mask="auto", **kw):
+        """darfix-style square 2-D colour stamp of the mean orientation.
+
+        Fixed per-axis colour ranges (the grain's own COM range by default) —
+        see :func:`starling.properties.orientation_stamp`. Returns
+        ``(rgb, color_key, vrange)``.
+        """
+        m = self._resolve_mask(mask)
+        mean, _ = self.moments(mask=m)
+        return properties.orientation_stamp(
+            mean, axes=axes, vrange=vrange, colormap_name=colormap_name,
+            sat=sat, mask=m, **kw,
+        )
 
     def strain(self, motor="ccmth", axis=None, reference=None, mask="auto"):
         """Strain map from the orientation/COM along a motor axis.

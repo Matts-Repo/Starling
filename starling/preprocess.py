@@ -146,6 +146,38 @@ def subtract(data, background):
     return data
 
 
+def threshold_removal(data, bottom=None, top=None):
+    """In-place absolute-count threshold (darfix ``THRESHOLD`` parity).
+
+    Zeroes pixels strictly below ``bottom`` and/or strictly above ``top``, per
+    frame, exactly like darfix's ``threshold_removal`` op. This is a hard clip
+    on counts, independent of background subtraction.
+
+    Usually unnecessary in starling: the clamped :func:`subtract` already
+    removes the pedestal correctly (it clips each value to >= background
+    before subtracting — the same net behaviour as darfix's
+    ``background_subtraction``, which zeroes below-background pixels first).
+    Use this only to additionally cut a hard noise floor / saturation ceiling,
+    or to replicate a darfix pipeline for comparison runs. Recommended slot in
+    the chain when used: after hot-pixel removal (so zingers are median-filled
+    rather than zeroed) and before background subtraction (so ``bottom`` acts
+    on genuine raw counts).
+
+    Args:
+        data (numpy.ndarray): shape (a, b, ...), modified in place.
+        bottom (scalar, optional): zero pixels ``< bottom``.
+        top (scalar, optional): zero pixels ``> top``.
+
+    Returns:
+        numpy.ndarray: the same array, modified in place.
+    """
+    if bottom is not None:
+        data[data < bottom] = 0
+    if top is not None:
+        data[data > top] = 0
+    return data
+
+
 def signed_zsum(data, background):
     """Unclamped background-free z-sum: ``sum_k (frame_k - bg)`` (float).
 
@@ -570,6 +602,13 @@ def subtracted(data, background):
     """Non-destructive :func:`subtract` — returns a new array, leaves data intact."""
     out = data.copy()
     subtract(out, background)
+    return out
+
+
+def thresholded(data, bottom=None, top=None):
+    """Non-destructive :func:`threshold_removal` — returns a new array."""
+    out = data.copy()
+    threshold_removal(out, bottom=bottom, top=top)
     return out
 
 

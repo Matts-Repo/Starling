@@ -19,7 +19,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest", "matplotlib"]
+dev = ["pytest", "matplotlib", "colorstamps"]
+viz = ["matplotlib", "colorstamps", "ipywidgets", "ipympl"]
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: heavy local validation tests (large real datasets)",
+]
 
 [project.scripts]
 starling = "starling.batch.cli:main"

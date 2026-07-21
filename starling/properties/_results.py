@@ -11,7 +11,12 @@ from typing import Optional
 
 import numpy as np
 
-from ._maps import FWHM_FACTOR, mosaicity as _mosaicity, orientation_map as _orientation_map
+from ._maps import (
+    FWHM_FACTOR,
+    mosaicity as _mosaicity,
+    orientation_map as _orientation_map,
+    orientation_stamp as _orientation_stamp,
+)
 
 
 def _to_h5(path, kind, fields, attrs=None):
@@ -116,6 +121,15 @@ class GaussNDResult:
     def orientation(self, axes=(0, 1), norm="dynamic", as_rgb=False):
         """Mean-orientation map from the fitted centre (see properties.orientation_map)."""
         return _orientation_map(self.mu, axes=axes, norm=norm, as_rgb=as_rgb)
+
+    def orientation_stamp(self, axes=(0, 1), mask=None, **kw):
+        """darfix-style fixed-range colour stamp of the fitted centre.
+
+        ``mask`` should be the grain/ok mask (e.g. ``success > 0.5``); see
+        :func:`starling.properties.orientation_stamp`.
+        """
+        m = mask if mask is not None else (np.asarray(self.success) > 0.5)
+        return _orientation_stamp(self.mu, axes=axes, mask=m, **kw)
 
     @property
     def raw(self):
@@ -358,6 +372,13 @@ class MomentResult:
     def orientation(self, axes=(0, 1), norm="dynamic", as_rgb=False):
         """Mean-orientation map from the first moment (see properties.orientation_map)."""
         return _orientation_map(self.mean, axes=axes, norm=norm, as_rgb=as_rgb)
+
+    def orientation_stamp(self, axes=(0, 1), mask=None, **kw):
+        """darfix-style fixed-range colour stamp of the first moment.
+
+        See :func:`starling.properties.orientation_stamp`.
+        """
+        return _orientation_stamp(self.mean, axes=axes, mask=mask, **kw)
 
     @classmethod
     def from_dict(cls, d):

@@ -4,6 +4,8 @@
                     dataset; drag or type to pick an ROI before loading.
 ``denoise_widget`` — non-destructive noise-reduction preview; only commits to
                     the dataset when Apply is pressed.
+``pixel_inspector`` — click a map pixel to inspect its per-motor-axis rocking
+                    curve(s) and the fitted-model overlay.
 
 ipywidgets and matplotlib are imported lazily so importing ``starling`` never
 requires them.
@@ -341,3 +343,277 @@ def denoise_widget(dset, bg_n=5, bg_mode="mean", bg_percentile=10.0, hot_sigma=5
     box = widgets.VBox([controls, status])
     display(box)
     return box
+
+
+# ── pixel rocking-curve inspector ───────────────────────────────────────────
+
+
+def _axis_grid_values(motors, i, D):
+    """Motor grid positions along axis ``i`` (others held at index 0).
+
+    ``motors`` is ``(D, *grid)`` for a multi-motor scan or a 1-D array of
+    positions for a single motor. For axis ``i`` the returned 1-D values are
+    ``motors[i]`` sliced with axis ``i`` free and every other grid axis at 0.
+    """
+    m = np.asarray(motors, dtype=np.float64)
+    if m.ndim == 1:  # single-motor scan
+        return m
+    sel = [0] * D
+    sel[i] = slice(None)
+    return np.asarray(m[i][tuple(sel)], dtype=np.float64)
+
+
+def pixel_inspector(dset, result=None, fit_status=None, cmap="hot", map_data=None):
+    """Click a pixel on the map to inspect its rocking curve(s) and fit.
+
+    Left: z-sum (or ``map_data``) image. Click any pixel: right panel(s) show,
+    for each motor axis, the 1-D marginal profile of the raw data at that
+    pixel (sum over the other motor axes) with, when ``result`` is given, the
+    fitted model's matching 1-D slice through the fitted centre overlaid,
+    plus a text readout of fitted parameters and fit_status.
+    Requires %matplotlib widget (ipympl).
+
+    The raw curve for axis ``i`` is a **marginal** (the pixel's data summed
+    over every other motor axis), while the overlaid fit line is a **centre
+    slice** — the fitted model evaluated along axis ``i`` with the other
+    coordinates pinned to the fitted centre. These are different reductions,
+    so their amplitudes are not expected to match; the fit slice is therefore
+    rescaled by ``raw.max() / fit_slice.max()`` (shown as "scaled" in the
+    legend) so the *shapes* can be compared. ``dset`` is never mutated.
+
+    Args:
+        dset: a ``starling.DataSet`` (or any object exposing ``.data`` of shape
+            ``(ny, nx, *motor_dims)`` and ``.motors`` of shape ``(D, *grid)`` /
+            1-D for a single motor).
+        result: optional ``Gauss1DResult`` or ``GaussNDResult`` to overlay.
+        fit_status: optional ``(ny, nx)`` integer status map (see
+            ``starling.properties.STATUS_NAMES``); enables the status readout
+            and the overlay checkbox.
+        cmap: initial colormap for the map (also the Dropdown default).
+        map_data: optional ``(ny, nx)`` array to show on the left instead of
+            the z-sum (e.g. a mosaicity or amplitude map).
+
+    Returns:
+        The ipywidgets container (also displayed in the notebook).
+    """
+    import ipywidgets as widgets
+    import matplotlib.pyplot as plt
+    from IPython.display import display
+
+    from .properties import STATUS_NAMES
+
+    data = np.asarray(dset.data)
+    ny, nx = data.shape[:2]
+    D = data.ndim - 2  # number of motor axes
+    if D < 1:
+        raise ValueError("dset.data must have at least one motor axis")
+
+    # per-axis motor grid values (x-axes for the rocking curves)
+    x_vals = [_axis_grid_values(dset.motors, i, D) for i in range(D)]
+
+    # left-panel background map (never mutates dset)
+    if map_data is not None:
+        base_map = np.asarray(map_data, dtype=np.float64)
+    else:
+        base_map = data.sum(axis=tuple(2 + i for i in range(D))).astype(np.float64)
+
+    fstat = None if fit_status is None else np.asarray(fit_status)
+
+    # classify the result object (only Gauss1D / GaussND are overlaid)
+    is_nd = result is not None and hasattr(result, "cov") and hasattr(result, "mu")
+    is_1d = (
+        result is not None
+        and not is_nd
+        and all(hasattr(result, a) for a in ("A", "sigma", "mu", "k", "m"))
+    )
+
+    cmap_options = ["hot", "viridis", "magma", "Greys_r"]
+    if cmap not in cmap_options:
+        cmap_options = [cmap] + cmap_options
+
+    # ── figure: map on the left, D stacked rocking-curve axes on the right ──
+    fig = plt.figure(figsize=(11, max(3.0, 2.4 * D)))
+    gs = fig.add_gridspec(D, 2, width_ratios=[1.25, 1.0])
+    ax_map = fig.add_subplot(gs[:, 0])
+    curve_axes = [fig.add_subplot(gs[i, 1]) for i in range(D)]
+
+    state = {"row": None, "col": None, "marker": None, "overlay": []}
+
+    def _draw_map():
+        ax_map.clear()
+        ax_map.imshow(base_map, cmap=cmap_w.value, origin="lower",
+                      interpolation="nearest")
+        ax_map.set_title("z-sum" if map_data is None else "map")
+        ax_map.set_xlabel("column (nx)")
+        ax_map.set_ylabel("row (ny)")
+        state["marker"] = None
+        state["overlay"] = []
+        if fstat is not None and status_w is not None and status_w.value:
+            _add_status_overlay()
+        if state["row"] is not None:
+            _draw_marker()
+        fig.canvas.draw_idle()
+
+    def _add_status_overlay():
+        # orange contour of edge-clipped (==2), grey wash of failed (==3)
+        edge = (fstat == 2).astype(float)
+        if edge.any():
+            cs = ax_map.contour(edge, levels=[0.5], colors="orange", linewidths=1.5)
+            state["overlay"].append(cs)
+        failed = np.where(fstat == 3, 1.0, np.nan)
+        if np.isfinite(failed).any():
+            im = ax_map.imshow(failed, cmap="Greys", origin="lower",
+                               vmin=0.0, vmax=1.0, alpha=0.5,
+                               interpolation="nearest")
+            state["overlay"].append(im)
+
+    def _clear_status_overlay():
+        for art in state["overlay"]:
+            try:
+                art.remove()
+            except (ValueError, AttributeError):
+                # older mpl QuadContourSet: remove member collections
+                for coll in getattr(art, "collections", []):
+                    coll.remove()
+        state["overlay"] = []
+        fig.canvas.draw_idle()
+
+    def _draw_marker():
+        if state["marker"] is not None:
+            try:
+                state["marker"].remove()
+            except ValueError:
+                pass
+        (state["marker"],) = ax_map.plot(
+            state["col"], state["row"], "+", color="cyan", ms=12, mew=2
+        )
+
+    def _eval_fit_slice(row, col, i, xf):
+        """Fitted-model centre slice along axis ``i`` at pixel (row, col)."""
+        if is_nd:
+            var_i = float(result.cov[row, col, i, i])
+            if not np.isfinite(var_i) or var_i <= 0:
+                return None
+            A = float(result.A[row, col])
+            mu_i = float(result.mu[row, col, i])
+            c = float(result.c[row, col])
+            return A * np.exp(-0.5 * (xf - mu_i) ** 2 / var_i) + c
+        if is_1d:  # gauss1d_lin, single motor axis
+            sigma = float(result.sigma[row, col])
+            if not np.isfinite(sigma) or sigma <= 0:
+                return None
+            A = float(result.A[row, col])
+            mu = float(result.mu[row, col])
+            k = float(result.k[row, col])
+            m = float(result.m[row, col])
+            return A * np.exp(-0.5 * (xf - mu) ** 2 / sigma ** 2) + k * xf + m
+        return None
+
+    def _param_text(row, col):
+        lines = [f"pixel (row={row}, col={col})"]
+        if fstat is not None:
+            s = int(fstat[row, col])
+            name = STATUS_NAMES.get(s, str(s))
+            edge = "  (peak at scan-range edge)" if s == 2 else ""
+            lines.append(f"status: {s} — {name}{edge}")
+        if is_nd:
+            mu = np.asarray(result.mu[row, col])
+            lines.append(f"A = {float(result.A[row, col]):.4g}")
+            lines.append("mu = [" + ", ".join(f"{v:.4g}" for v in mu) + "]")
+            diag = np.diagonal(np.asarray(result.cov[row, col]))
+            lines.append("var = [" + ", ".join(f"{v:.3g}" for v in diag) + "]")
+            lines.append(f"c = {float(result.c[row, col]):.4g}")
+            lines.append(f"success = {float(result.success[row, col]):.3g}")
+        elif is_1d:
+            lines.append(f"A = {float(result.A[row, col]):.4g}")
+            lines.append(f"sigma = {float(result.sigma[row, col]):.4g}")
+            lines.append(f"mu = {float(result.mu[row, col]):.4g}")
+            lines.append(f"k = {float(result.k[row, col]):.4g}")
+            lines.append(f"m = {float(result.m[row, col]):.4g}")
+            lines.append(f"success = {float(result.success[row, col]):.3g}")
+        return "\n".join(lines)
+
+    def _draw_curves(row, col):
+        cube = data[row, col].astype(np.float64)  # shape motor_dims
+        title = f"pixel ({row}, {col})"
+        if fstat is not None:
+            s = int(fstat[row, col])
+            title += f"  |  {STATUS_NAMES.get(s, s)}"
+            if s == 2:
+                title += " (peak at scan-range edge)"
+        for i, ax in enumerate(curve_axes):
+            ax.clear()
+            other = tuple(j for j in range(D) if j != i)
+            raw = cube.sum(axis=other) if other else cube
+            x = x_vals[i]
+            ax.plot(x, raw, "o-", ms=3, lw=1.2, color="C0", label="raw (marginal)")
+            if result is not None:
+                xf = np.linspace(float(np.min(x)), float(np.max(x)), 200)
+                fit = _eval_fit_slice(row, col, i, xf)
+                if fit is not None:
+                    fmax = float(np.max(fit))
+                    rmax = float(np.max(raw))
+                    if is_nd and np.isfinite(fmax) and fmax != 0:
+                        fit = fit * (rmax / fmax)
+                        lbl = "fit (centre slice, scaled)"
+                    else:
+                        lbl = "fit"
+                    ax.plot(xf, fit, "-", lw=1.5, color="C3", label=lbl)
+            ax.set_xlabel(f"motor {i}")
+            ax.set_ylabel("counts")
+            ax.legend(fontsize=7, loc="best")
+        curve_axes[0].set_title(title, fontsize=9)
+        fig.canvas.draw_idle()
+
+    # ── widgets ────────────────────────────────────────────────────────────
+    cmap_w = widgets.Dropdown(options=cmap_options, value=cmap, description="cmap:")
+    status_w = None
+    if fstat is not None:
+        status_w = widgets.Checkbox(value=False, description="overlay status")
+    readout = widgets.Output()
+
+    def _on_cmap(_):
+        _draw_map()
+
+    cmap_w.observe(_on_cmap, names="value")
+
+    def _on_status(_):
+        if status_w.value:
+            _add_status_overlay()
+        else:
+            _clear_status_overlay()
+        fig.canvas.draw_idle()
+
+    if status_w is not None:
+        status_w.observe(_on_status, names="value")
+
+    def _on_click(event):
+        if event.inaxes is not ax_map or event.xdata is None or event.ydata is None:
+            return
+        col = int(round(event.xdata))
+        row = int(round(event.ydata))
+        if not (0 <= row < ny and 0 <= col < nx):
+            return
+        state["row"], state["col"] = row, col
+        _draw_marker()
+        _draw_curves(row, col)
+        with readout:
+            readout.clear_output()
+            print(_param_text(row, col))
+
+    fig.canvas.mpl_connect("button_press_event", _on_click)
+    # expose the handler for headless testing (call it with a mock event that
+    # has .inaxes / .xdata / .ydata) without going through the mpl event stack
+    fig._starling_on_click = _on_click
+
+    _draw_map()
+    for ax in curve_axes:
+        ax.set_xlabel("motor")
+        ax.set_ylabel("counts")
+    curve_axes[0].set_title("click a pixel on the map", fontsize=9)
+    fig.tight_layout()
+
+    ctrl_row = [cmap_w] + ([status_w] if status_w is not None else [])
+    container = widgets.VBox([widgets.HBox(ctrl_row), readout])
+    display(container)
+    return container

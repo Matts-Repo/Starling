@@ -47,7 +47,7 @@ def _colour_key(size=129):
     return rgb
 
 
-def orientation_map(mean, axes=(0, 1), norm="dynamic", as_rgb=False):
+def orientation_map(mean, axes=(0, 1), norm="dynamic", as_rgb=False, mask=None):
     """Per-pixel MEAN orientation (centre of mass) for the chosen motor axes.
 
     This is an **ORIENTATION** map, **NOT** mosaicity. It is the first moment of
@@ -69,6 +69,11 @@ def orientation_map(mean, axes=(0, 1), norm="dynamic", as_rgb=False):
             deviation range (robust 2-98 percentile); a float fixes the full
             scale magnitude in motor units.
         as_rgb (bool): if True, also build the colour image.
+        mask (numpy.ndarray, optional): (ny, nx) bool grain mask — restricts
+            the "dynamic" scale (and the deviation reference) to grain
+            pixels, so off-grain outliers cannot inflate the scale and wash
+            the grain out to a single colour block. Prefer
+            :func:`orientation_stamp` for darfix-style fixed-range colour.
 
     Returns:
         If ``as_rgb`` is False: the orientation map — (ny, nx) for one axis or
@@ -88,9 +93,13 @@ def orientation_map(mean, axes=(0, 1), norm="dynamic", as_rgb=False):
     if not as_rgb:
         return sel
 
-    # deviation about the map median (NaN-aware)
+    # deviation about the map median (NaN-aware, grain-masked when given)
     k = comps.shape[-1]
-    ref = np.nanmedian(comps.reshape(-1, k), axis=0)
+    if mask is not None:
+        sel_px = comps[np.asarray(mask, dtype=bool)]
+        ref = np.nanmedian(sel_px.reshape(-1, k), axis=0)
+    else:
+        ref = np.nanmedian(comps.reshape(-1, k), axis=0)
     dev = comps - ref  # (ny, nx, k)
     if k == 1:
         dx = dev[..., 0]
@@ -101,6 +110,8 @@ def orientation_map(mean, axes=(0, 1), norm="dynamic", as_rgb=False):
     mag = np.sqrt(dx ** 2 + dy ** 2)
     if norm == "dynamic":
         finite = np.isfinite(mag)
+        if mask is not None:
+            finite &= np.asarray(mask, dtype=bool)
         scale = np.nanpercentile(mag[finite], 98) if finite.any() else 1.0
         scale = max(scale, 1e-12)
     else:
@@ -112,7 +123,94 @@ def orientation_map(mean, axes=(0, 1), norm="dynamic", as_rgb=False):
     rgb = _hsv_to_rgb(hue, sat, val)
     nan = ~np.isfinite(mag)
     rgb[nan] = 1.0  # white where there is no data
+    if mask is not None:
+        rgb[~np.asarray(mask, dtype=bool)] = 1.0
     return sel, rgb, _colour_key()
+
+
+def orientation_stamp(mean, axes=(0, 1), vrange=None, colormap_name="hsv",
+                      sat=40, mask=None, key_size=256):
+    """darfix-style square 2-D colour stamp for two orientation axes.
+
+    Unlike :func:`orientation_map` (round HSV wheel, dynamic
+    percentile-of-deviation scale — which collapses to a near-uniform block
+    when a few outlier pixels inflate the scale), this maps the two COM
+    components through ``colorstamps.apply_stamp`` with **fixed per-axis
+    vmin/vmax** — darfix's exact recipe — so the full colour square is spent
+    on the grain's own orientation range.
+
+    Display conventions (darfix parity): masked-off / non-finite pixels are
+    black; in-range pixels get the stamp colour; out-of-range pixels (only
+    possible with an explicit ``vrange``) are mid-grey.
+
+    Args:
+        mean (numpy.ndarray): (ny, nx, D) first-moment/COM array (or a
+            (ny, nx, 2) slice), e.g. ``GaussNDResult.mu``.
+        axes (tuple): the two components of ``mean`` to map (x-ish, y-ish).
+        vrange (tuple, optional): ((lo0, hi0), (lo1, hi1)) fixed ranges per
+            selected axis, in motor units. ``None`` uses each component's own
+            finite min/max over ``mask`` (darfix default).
+        colormap_name (str): colorstamps map — "hsv" (darfix default),
+            "cut", "orangeBlue", "flat", ...
+        sat (float): colorstamps saturation parameter (darfix default 40).
+        mask (numpy.ndarray, optional): (ny, nx) bool; False pixels are
+            rendered black and excluded from the auto ``vrange``.
+        key_size (int): side length of the colour-key legend image.
+
+    Returns:
+        tuple: ``(rgb, color_key, vrange)`` — the (ny, nx, 3) image in
+        [0, 1], the (key_size, key_size, 3) legend (plot with
+        ``extent=(lo0, hi0, lo1, hi1)`` from the returned ``vrange``), and
+        the ((lo0, hi0), (lo1, hi1)) ranges actually used.
+    """
+    import colorstamps
+
+    mean = np.asarray(mean, dtype=float)
+    if mean.ndim == 2:
+        raise ValueError(
+            "orientation_stamp needs two orientation components; got a "
+            "single-motor (ny, nx) map"
+        )
+    c0 = mean[..., axes[0]].astype(float)
+    c1 = mean[..., axes[1]].astype(float)
+
+    valid = np.isfinite(c0) & np.isfinite(c1)
+    if mask is not None:
+        valid &= np.asarray(mask, dtype=bool)
+
+    if vrange is None:
+        if not valid.any():
+            raise ValueError("no valid pixels to derive the colour range from")
+        vrange = (
+            (float(np.min(c0[valid])), float(np.max(c0[valid]))),
+            (float(np.min(c1[valid])), float(np.max(c1[valid]))),
+        )
+    (lo0, hi0), (lo1, hi1) = vrange
+    if not (hi0 > lo0) or not (hi1 > lo1):
+        raise ValueError(f"degenerate colour range {vrange}")
+
+    # colorstamps mangles NaN input (invalid int cast) — feed range-midpoint
+    # placeholders at invalid pixels and repaint them black afterwards
+    f0 = np.where(valid, c0, 0.5 * (lo0 + hi0))
+    f1 = np.where(valid, c1, 0.5 * (lo1 + hi1))
+
+    rgb, stamp = colorstamps.apply_stamp(
+        f0,
+        f1,
+        colormap_name,
+        vmin_0=lo0,
+        vmax_0=hi0,
+        vmin_1=lo1,
+        vmax_1=hi1,
+        sat=sat,
+        clip="none",
+        l=key_size,
+    )
+    out_of_range = np.isnan(rgb).any(axis=-1)
+    rgb = np.clip(np.nan_to_num(rgb, nan=0.2), 0.0, 1.0)
+    rgb[out_of_range & valid] = 0.2  # grey: COM outside the fixed range
+    rgb[~valid] = 0.0                # black: no data / off-mask
+    return rgb, np.clip(np.asarray(stamp.cmap), 0.0, 1.0), vrange
 
 
 def mosaicity(cov, mode="scalar", axes=None):

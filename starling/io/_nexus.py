@@ -48,6 +48,8 @@ _MOSAICITY = "Mosaicity"
 _COLOR_KEY = "Color Key"
 _KAM = "Kernel Average Misorientation"
 _MOSAICITY_SPREAD = "Mosaicity spread"  # starling extra: scalar RMS orientation spread
+_FIT_STATUS = "Fit status"  # starling extra: per-pixel fit-quality category map
+_FIT_STATUS_ENCODING = "0=no_signal 1=ok 2=edge_clipped 3=failed"
 # starling extras for the two-peak N-D fit (darfix has no multi-peak maps)
 _N_PEAKS = "Number of peaks"
 _PEAK_SEP = "Peak separation"
@@ -309,8 +311,15 @@ def _write_process(entry, result_kind):
     return proc
 
 
-def _write_raw(proc, fields, *, D, orientation_axes, motor_units, mask, pixel_size_mm):
-    """The round-trip NXcollection: verbatim float64 dataclass fields, unmasked."""
+def _write_raw(proc, fields, *, D, orientation_axes, motor_units, mask, pixel_size_mm,
+               fit_status=None):
+    """The round-trip NXcollection: verbatim float64 dataclass fields, unmasked.
+
+    ``fit_status`` (if given) is stored verbatim as an int8 sibling dataset so
+    the categorical encoding survives round-trip losslessly (the entry-level
+    ``Fit status`` NXdata is a float64 display copy). ``from_dict`` selects its
+    own keys, so this extra dataset is harmless on result reconstruction.
+    """
     raw = proc.create_group("raw")
     raw.attrs["NX_class"] = "NXcollection"
     for k, v in fields.items():
@@ -325,6 +334,9 @@ def _write_raw(proc, fields, *, D, orientation_axes, motor_units, mask, pixel_si
         raw.attrs["pixel_size_mm"] = np.asarray(pixel_size_mm, dtype=np.float64)
     if mask is not None:
         raw.create_dataset("mask", data=np.asarray(mask, dtype=bool))
+    if fit_status is not None:
+        ds = _write_dataset(raw, "fit_status", np.asarray(fit_status, dtype=np.int8))
+        ds.attrs["encoding"] = _FIT_STATUS_ENCODING
     return raw
 
 
@@ -354,6 +366,23 @@ def _mask_display(arr2d, keep):
     out = np.array(arr2d, dtype=np.float64, copy=True)
     out[~keep] = np.nan
     return out
+
+
+def _write_fit_status(ent, fit_status, y, x, x_units):
+    """Write the categorical ``Fit status`` NXdata at the entry level.
+
+    Never NaN-masked: the whole point of the map is to distinguish the
+    ``NO_SIGNAL``/``OK``/``EDGE_CLIPPED``/``FAILED`` categories (see
+    :func:`starling.properties.classify_fit_status`). Stored float64 for silx
+    friendliness; the verbatim int8 array lives in the raw NXcollection.
+    """
+    if fit_status is None:
+        return
+    _write_image_nxdata(
+        ent, _FIT_STATUS, _f64(fit_status), y, x, x_units,
+        extra_signal_attrs={"quantity": "fit_status",
+                            "encoding": _FIT_STATUS_ENCODING},
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -432,6 +461,7 @@ def save_nexus(
     path, result, motors=None, scan_params=None, *, mask=None,
     orientation_axes=(0, 1), kam_size=(3, 3), pixel_size_mm=None,
     motor_units="deg", layer_values=None, entry="entry", extra_attrs=None,
+    fit_status=None,
 ):
     """Write a starling result object to a standards-compliant NeXus file.
 
@@ -458,19 +488,33 @@ def save_nexus(
             layer) used as the ``layer`` axis; defaults to the layer index.
         entry: NXentry group name.
         extra_attrs: extra root attributes (non-scalars JSON-encoded).
+        fit_status: optional ``(ny, nx)`` int array from
+            :func:`starling.properties.classify_fit_status`
+            (``0=no_signal 1=ok 2=edge_clipped 3=failed``). Written as its own
+            ``Fit status`` NXdata at the entry level for every result kind, and
+            stored verbatim (int8) in the raw block. Never NaN-masked -- the map
+            is meant to distinguish the categories, including off-grain pixels.
+            (The same categories are also persistable alongside a bundle via
+            :func:`starling.io.save_bundle`'s masks.)
+
+    Note:
+        For the ``D >= 2`` orientation image this writes darfix's square colour
+        stamp (``result.orientation_stamp``, via the ``colorstamps`` package)
+        with a matching axed ``Color Key``; if ``colorstamps`` is not installed
+        it falls back to the legacy round HSV wheel with a warning.
     """
     kind = _result_kind(result)
     if kind == "gauss1d_sweep":
         return _save_sweep_nexus(
             path, result, motors, scan_params, mask=mask, pixel_size_mm=pixel_size_mm,
             motor_units=motor_units, layer_values=layer_values, entry=entry,
-            extra_attrs=extra_attrs,
+            extra_attrs=extra_attrs, fit_status=fit_status,
         )
     if kind == "gaussND_two":
         return _save_two_peak_nexus(
             path, result, motors, scan_params, mask=mask, pixel_size_mm=pixel_size_mm,
             motor_units=motor_units, orientation_axes=orientation_axes, entry=entry,
-            extra_attrs=extra_attrs,
+            extra_attrs=extra_attrs, fit_status=fit_status,
         )
 
     D, centre, fwhm, success, extra = _components(result, kind)
@@ -498,8 +542,10 @@ def save_nexus(
         _write_raw(
             proc, raw_fields, D=D, orientation_axes=orientation_axes,
             motor_units=motor_units, mask=mask, pixel_size_mm=pixel_size_mm,
+            fit_status=fit_status,
         )
         _write_scan_group(ent, motors, scan_params, motor_units)
+        _write_fit_status(ent, fit_status, y, x, x_units)
 
         # ---- centre / FWHM (+ moment skew/kurtosis) -------------------------
         def _write_component_set(parent, i):
@@ -546,18 +592,39 @@ def save_nexus(
                 _write_component_set(coll, i)
 
             # ---- orientation RGB / colour key / scalar spread / KAM ---------
-            sel, rgb, key = result.orientation(axes=orientation_axes, as_rgb=True)
+            # darfix-parity square colour stamp (colorstamps); the fixed per-axis
+            # range spends the full colour square on the grain's own orientation
+            # range. Falls back to the legacy round HSV wheel if colorstamps is
+            # not installed, so a minimal install never hard-fails on save.
+            try:
+                rgb, key, vrange = result.orientation_stamp(
+                    axes=orientation_axes, mask=keep,
+                )
+                (klo0, khi0), (klo1, khi1) = vrange
+                key_y = np.linspace(klo0, khi0, key.shape[0])
+                key_x = np.linspace(klo1, khi1, key.shape[1])
+            except ImportError:
+                warnings.warn(
+                    "colorstamps not installed; the Mosaicity image falls back "
+                    "to the legacy round HSV orientation wheel and the Color Key "
+                    "uses a fixed -1..1 range.",
+                    UserWarning, stacklevel=2,
+                )
+                _, rgb, key = result.orientation(axes=orientation_axes, as_rgb=True)
+                key_y = np.linspace(-1.0, 1.0, key.shape[0])
+                key_x = np.linspace(-1.0, 1.0, key.shape[1])
             rgb = np.array(rgb, dtype=np.float64, copy=True)
             if keep is not None:
-                rgb[~keep] = 1.0  # masked RGB -> white (never NaN; NaN breaks silx)
+                # NeXus display override: masked-off pixels are WHITE, not the
+                # stamp's black (never NaN; NaN breaks silx rgba rendering).
+                rgb[~keep] = 1.0
             _write_image_nxdata(
                 ent, _MOSAICITY, rgb, y, x, x_units, interpretation="rgba-image",
                 rgba=True, extra_signal_attrs={"source": source},
             )
             _write_image_nxdata(
                 ent, _COLOR_KEY, np.asarray(key, dtype=np.float64),
-                np.linspace(-1.0, 1.0, key.shape[0]),
-                np.linspace(-1.0, 1.0, key.shape[1]), "orientation",
+                key_y, key_x, motor_units,
                 interpretation="rgba-image", rgba=True, rgba_axes=("ky", "kx"),
             )
 
@@ -581,7 +648,7 @@ def save_nexus(
 
 def _save_sweep_nexus(
     path, results, motors, scan_params, *, mask, pixel_size_mm, motor_units,
-    layer_values, entry, extra_attrs,
+    layer_values, entry, extra_attrs, fit_status=None,
 ):
     """Strain-sweep branch: a ``list[Gauss1DResult]`` -> stacked layer axis."""
     if not results:
@@ -627,9 +694,10 @@ def _save_sweep_nexus(
         raw_fields["layer_mu"] = layer_mu
         _write_raw(
             proc, raw_fields, D=1, orientation_axes=(0, 1), motor_units=motor_units,
-            mask=mask, pixel_size_mm=pixel_size_mm,
+            mask=mask, pixel_size_mm=pixel_size_mm, fit_status=fit_status,
         )
         _write_scan_group(ent, motors, scan_params, motor_units)
+        _write_fit_status(ent, fit_status, y, x, x_units)
 
         for cname, cvals, q in (
             (_COM, centre, "fit_peak_center"), (_FWHM, fwhm, "fit_fwhm"),
@@ -649,7 +717,7 @@ def _save_sweep_nexus(
 
 def _save_two_peak_nexus(
     path, result, motors, scan_params, *, mask, pixel_size_mm, motor_units,
-    orientation_axes, entry, extra_attrs,
+    orientation_axes, entry, extra_attrs, fit_status=None,
 ):
     """Two-peak N-D fit branch: n_peaks + per-peak/per-axis + separation maps.
 
@@ -676,8 +744,10 @@ def _save_two_peak_nexus(
         _write_raw(
             proc, raw_fields, D=D, orientation_axes=orientation_axes,
             motor_units=motor_units, mask=mask, pixel_size_mm=pixel_size_mm,
+            fit_status=fit_status,
         )
         _write_scan_group(ent, motors, scan_params, motor_units)
+        _write_fit_status(ent, fit_status, y, x, x_units)
 
         _write_image_nxdata(
             ent, _N_PEAKS,
@@ -748,8 +818,9 @@ def load_nexus(path):
     strain sweep), field-for-field equal to the original (the raw block is
     unmasked float64). ``maps`` is the display maps keyed by their darfix names.
     ``meta`` holds provenance (scan params, axis vectors, units, program/version/
-    date, D, orientation_axes, pixel_size_mm, extra attrs, and -- for a sweep --
-    ``layer_mu``).
+    date, D, orientation_axes, pixel_size_mm, extra attrs, the verbatim int8
+    ``fit_status`` categories or ``None``, and -- for a sweep -- ``layer_mu``).
+    The categorical ``Fit status`` display map also appears in ``maps``.
     """
     with h5py.File(path, "r") as f:
         entry_name = _decode(f.attrs.get("default", "entry"))
@@ -817,6 +888,9 @@ def load_nexus(path):
         }
         if kind == "gauss1d_sweep":
             meta["layer_mu"] = np.asarray(raw["layer_mu"])
+        # verbatim int8 fit-status categories (0/1/2/3), if written
+        meta["fit_status"] = (np.asarray(raw["fit_status"], dtype=np.int8)
+                              if "fit_status" in raw else None)
 
         if "scan" in ent:
             scan = ent["scan"]

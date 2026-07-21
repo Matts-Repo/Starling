@@ -85,6 +85,106 @@ def _warn_if_not_separable(motors, scan_id, tol_frac=0.25):
 
 
 # --------------------------------------------------------------------------- #
+# acquisition-mode detection (report-only; never changes the sort)
+# --------------------------------------------------------------------------- #
+
+# BLISS fast_motor_mode string -> raster/zigzag classification. REWIND rewinds
+# to the row start before each fast sweep (all rows same direction = raster);
+# ZIGZAG reverses the fast sweep on alternate rows (snake). Anything else is
+# reported verbatim but classified "unknown".
+_FAST_MOTOR_MODE_MAP = {"REWIND": "raster", "ZIGZAG": "zigzag"}
+
+
+def _fast_motor_grid(h5f, scan_id, motors=None, row_len=None):
+    """Fast-motor values as an (n_slow, n_fast) grid in acquisition order.
+
+    Prefers a caller-supplied acquisition-order ``motors`` array (the reader
+    already has it): a (2, m, n) grid is used directly; a flat (2, n_frames)
+    array is reshaped with ``row_len``. Otherwise the fast-motor dataset is
+    read straight from the file and reshaped from the scan command's grid.
+    """
+    if motors is not None:
+        arr = np.asarray(motors, dtype=np.float64)
+        if arr.ndim == 3:
+            return arr[1]
+        if arr.ndim == 2 and row_len:
+            n = int(row_len)
+            fast = arr[1].reshape(-1)
+            m = fast.size // n
+            return fast[: m * n].reshape(m, n)
+
+    cfg = ID03("")
+    title = h5f[scan_id]["title"][()]
+    title = title.decode("utf-8") if isinstance(title, bytes) else str(title)
+    parts = title.split()
+    command = parts[0]
+    args = parts[1:]
+    steps_idx = cfg.scan_arg_pos["motor_steps"][command]
+    shape = np.array(args)[steps_idx].astype(int)
+    if command in ("a2scan", "ascan", "amesh"):
+        shape = shape + 1
+    m, n = int(shape[0]), int(shape[1])
+    name_idx = cfg.scan_arg_pos["motor_names"][command][-1]  # fast = inner motor
+    fast_name = args[name_idx]
+    path = cfg.motor_map[fast_name]
+    grp = h5f[scan_id]
+    if path not in grp:
+        path = cfg.fallback_motor_map.get(path)
+    return np.asarray(grp[path][...], dtype=np.float64).reshape(m, n)
+
+
+def _infer_mode_from_grid(grid):
+    """raster/zigzag/unknown from the per-row monotonic direction of a grid."""
+    m, n = grid.shape
+    if m < 2 or n < 2:
+        return "unknown"
+    dirs = np.sign(grid[:, -1] - grid[:, 0])  # +1 / -1 / 0 per slow row
+    if np.any(dirs == 0):
+        return "unknown"
+    if np.all(dirs == dirs[0]):
+        return "raster"
+    if np.all(dirs[1:] == -dirs[:-1]):  # each row reverses the previous
+        return "zigzag"
+    return "unknown"
+
+
+def detect_acquisition_mode(h5f_or_path, scan_id, motors=None):
+    """Report how a 2-motor scan was rastered.
+
+    Returns dict: {"mode": "zigzag"|"raster"|"unknown", "source":
+    "metadata"|"inferred"|"none", "fast_motor_mode": <raw str or None>}
+
+    The primary source is the BLISS ``instrument/fscan_parameters/
+    fast_motor_mode`` string (REWIND -> raster, ZIGZAG -> zigzag). Without it,
+    the mode is inferred from the fast-motor positions in acquisition order.
+    This is report-only: it never influences the de-zigzag sort, and never
+    raises — odd scans (darks, 1-motor, aborted) yield mode/source unknown/none.
+    """
+    unknown = {"mode": "unknown", "source": "none", "fast_motor_mode": None}
+    try:
+        if isinstance(h5f_or_path, (str, os.PathLike)):
+            with h5py.File(h5f_or_path, "r") as h5f:
+                return detect_acquisition_mode(h5f, scan_id, motors=motors)
+        h5f = h5f_or_path
+
+        mode_path = f"{scan_id}/instrument/fscan_parameters/fast_motor_mode"
+        if mode_path in h5f:
+            raw = h5f[mode_path][()]
+            raw = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+            mode = _FAST_MOTOR_MODE_MAP.get(raw.strip().upper(), "unknown")
+            return {"mode": mode, "source": "metadata", "fast_motor_mode": raw}
+
+        grid = _fast_motor_grid(h5f, scan_id, motors=motors)
+        return {
+            "mode": _infer_mode_from_grid(grid),
+            "source": "inferred",
+            "fast_motor_mode": None,
+        }
+    except Exception:
+        return dict(unknown)
+
+
+# --------------------------------------------------------------------------- #
 # frame-order permutations (computed from motors only, before any frame read)
 # --------------------------------------------------------------------------- #
 
@@ -246,6 +346,9 @@ class Reader:
         self.scan_params = None
         self.sensors = None
         self.n_workers = n_workers
+        # populated by readers that detect rastering (report-only); notebooks
+        # can read ``dset.reader.acquisition_mode`` after a load.
+        self.acquisition_mode = None
 
     def fetch(self, key):
         """Read an arbitrary h5 path (exotic motors, extra metadata)."""
@@ -356,6 +459,9 @@ class MosaScan(Reader):
     def _prepare(self, h5f, scan_id):
         scan_params, sensors = self.config(scan_id, h5f=h5f)
         motors = self._read_motors(h5f, scan_id, scan_params)
+        # report-only: how the scan was rastered (metadata or inferred from the
+        # acquisition-order motors). Never affects the de-zigzag sort below.
+        self.acquisition_mode = detect_acquisition_mode(h5f, scan_id, motors=motors)
         command = scan_params["scan_command"].split()[0]
         if command == "fscan2d":
             # acquisition order: axis -2 = slow (outer) levels, axis -1 = fast

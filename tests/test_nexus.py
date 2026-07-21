@@ -243,9 +243,10 @@ def test_gaussnd_two_silx_can_parse(tmp_path):
     silx = pytest.importorskip("silx")  # noqa: F841
     from silx.io.nxdata import get_default
 
-    default = get_default(_save(tmp_path, _gaussnd_two()))
-    assert default is not None
-    assert default.signal is not None
+    with h5py.File(_save(tmp_path, _gaussnd_two())) as f:  # silx wants a group
+        default = get_default(f)
+        assert default is not None
+        assert default.signal is not None
 
 
 # ------------------------------- NeXus attrs ------------------------------- #
@@ -315,12 +316,13 @@ def test_rgb_shapes_and_attrs(tmp_path):
         # (an unbacked @axes name makes silx reject the NXdata -> no auto-render)
         assert list(mos.attrs["axes"]) == ["y", "x", "."]
         assert mos["y"].shape == (NY,) and mos["x"].shape == (NX,)
+        # darfix-parity square colour stamp -> (S, S, 3) key at key_size=256
         key = f["entry/Color Key/Color Key"]
-        assert key.shape == (129, 129, 3)
+        assert key.shape == (256, 256, 3)
         assert key.attrs["interpretation"] == "rgba-image"
         ck = f["entry/Color Key"]
         assert list(ck.attrs["axes"]) == ["ky", "kx", "."]
-        assert ck["ky"].shape == (129,) and ck["kx"].shape == (129,)
+        assert ck["ky"].shape == (256,) and ck["kx"].shape == (256,)
 
 
 def test_kam_present_d2_absent_d1(tmp_path):
@@ -627,6 +629,141 @@ def test_extra_attrs_roundtrip(tmp_path):
     assert ea["params"] == {"a": 1, "b": [2, 3]}
 
 
+# ------------------------------ fit status --------------------------------- #
+
+
+def _fit_status(ny=NY, nx=NX, seed=7):
+    """A (ny, nx) int8 map spanning all four categories (0/1/2/3)."""
+    rng = np.random.default_rng(seed)
+    st = rng.integers(0, 4, (ny, nx)).astype(np.int8)
+    st[0, 0], st[0, 1], st[1, 0], st[1, 1] = 0, 1, 2, 3  # guarantee all present
+    return st
+
+
+def test_fit_status_nxdata_roundtrip(tmp_path):
+    """fit_status -> its own 'Fit status' NXdata + verbatim int8 raw round-trip."""
+    g = _gaussnd()
+    st = _fit_status()
+    p = _save(tmp_path, g, fit_status=st)
+    with h5py.File(p) as f:
+        ent = f["entry"]
+        assert "Fit status" in ent
+        sig = ent["Fit status/Fit status"]
+        assert sig.shape == (NY, NX)
+        assert sig.dtype == np.float64             # float cast for silx
+        assert sig.attrs["quantity"] == "fit_status"
+        assert sig.attrs["encoding"] == "0=no_signal 1=ok 2=edge_clipped 3=failed"
+        assert not np.isnan(sig[()]).any()          # never NaN-masked
+        assert np.array_equal(sig[()].astype(np.int8), st)  # int equality
+        # verbatim int8 in the raw block
+        raw_fs = f["entry/starling_process/raw/fit_status"]
+        assert raw_fs.dtype == np.int8
+        assert np.array_equal(raw_fs[()], st)
+    # round-trips through load_nexus: display map + meta int8, both exact
+    _, maps, meta = load_nexus(p)
+    assert "Fit status" in maps
+    assert np.array_equal(maps["Fit status"].astype(np.int8), st)
+    assert meta["fit_status"].dtype == np.int8
+    assert np.array_equal(meta["fit_status"], st)
+
+
+def test_fit_status_not_masked(tmp_path):
+    """Off-grain pixels stay categorical (0), not NaN, even with a grain mask."""
+    g = _gaussnd()
+    st = _fit_status()
+    st[0, 0] = 0  # off-grain / no-signal
+    mask = np.ones((NY, NX), dtype=bool)
+    mask[0, 0] = False
+    with h5py.File(_save(tmp_path, g, fit_status=st, mask=mask)) as f:
+        sig = f["entry/Fit status/Fit status"][()]
+        assert sig[0, 0] == 0.0 and not np.isnan(sig[0, 0])
+        assert np.array_equal(sig.astype(np.int8), st)
+
+
+def test_fit_status_all_kinds(tmp_path):
+    """fit_status threads through moments, 1-D, sweep and two-peak branches."""
+    st = _fit_status()
+    cases = {
+        "moments": _moments(order=2),
+        "gauss1d": _gauss1d(),
+        "pvoigt": _pseudovoigt(),
+        "two": _gaussnd_two(),
+    }
+    for name, res in cases.items():
+        with h5py.File(_save(tmp_path / name, res, fit_status=st)) as f:
+            assert np.array_equal(
+                f["entry/Fit status/Fit status"][()].astype(np.int8), st)
+            assert np.array_equal(
+                f["entry/starling_process/raw/fit_status"][()], st)
+    # strain sweep (list of Gauss1DResult)
+    layers = [_gauss1d(seed=s) for s in range(3)]
+    p = str(tmp_path / "sweep.nxs")
+    save_nexus(p, layers, fit_status=st)
+    with h5py.File(p) as f:
+        assert np.array_equal(
+            f["entry/Fit status/Fit status"][()].astype(np.int8), st)
+
+
+def test_no_fit_status_absent(tmp_path):
+    """Without the kwarg no 'Fit status' group is written and meta is None."""
+    with h5py.File(_save(tmp_path, _gaussnd())) as f:
+        assert "Fit status" not in f["entry"]
+        assert "fit_status" not in f["entry/starling_process/raw"]
+    _, maps, meta = load_nexus(_save(tmp_path / "b", _gaussnd()))
+    assert "Fit status" not in maps
+    assert meta["fit_status"] is None
+
+
+# --------------------------- square colour stamp --------------------------- #
+
+
+def test_color_key_stamp_axes_match_vrange(tmp_path):
+    """Color Key axes are the stamp's motor-unit vrange (not the old -1..1)."""
+    g = _gaussnd()
+    # replicate the exact stamp the writer builds (no mask -> keep is None)
+    _, key, vrange = g.orientation_stamp(axes=(0, 1), mask=None)
+    (lo0, hi0), (lo1, hi1) = vrange
+    S = key.shape[0]
+    with h5py.File(_save(tmp_path, g, motor_units="deg")) as f:
+        ck = f["entry/Color Key"]
+        sig = ck["Color Key"]
+        assert sig.shape == (S, S, 3)               # (S, S, 3) rgba convention
+        ky, kx = ck["ky"], ck["kx"]
+        assert ky.shape == (S,) and kx.shape == (S,)
+        assert ky.attrs["units"] == "deg" and kx.attrs["units"] == "deg"
+        assert np.allclose(ky[()], np.linspace(lo0, hi0, S))
+        assert np.allclose(kx[()], np.linspace(lo1, hi1, S))
+        # axes must NOT be the legacy fixed -1..1 range
+        assert not np.allclose(ky[()], np.linspace(-1.0, 1.0, S))
+
+
+def test_color_key_stamp_axes_moments(tmp_path):
+    """Moments D>=2 branch also routes through the square stamp Color Key."""
+    m = _moments(order=2)
+    _, key, vrange = m.orientation_stamp(axes=(0, 1), mask=None)
+    (lo0, hi0), (lo1, hi1) = vrange
+    S = key.shape[0]
+    with h5py.File(_save(tmp_path, m)) as f:
+        ck = f["entry/Color Key"]
+        assert ck["Color Key"].shape == (S, S, 3)
+        assert np.allclose(ck["ky"][()], np.linspace(lo0, hi0, S))
+
+
+def test_masked_stamp_white_offgrain(tmp_path):
+    """A masked save yields WHITE (1.0) rgb at off-mask pixels in the stamp."""
+    g = _gaussnd()
+    mask = np.ones((NY, NX), dtype=bool)
+    mask[0, 0] = False
+    mask[3, 2] = False
+    with h5py.File(_save(tmp_path, g, mask=mask)) as f:
+        rgb = f["entry/Mosaicity/Mosaicity"][()]
+        assert rgb.shape == (NY, NX, 3)
+        assert np.allclose(rgb[0, 0], 1.0)          # off-grain -> white
+        assert np.allclose(rgb[3, 2], 1.0)
+        assert not np.isnan(rgb).any()               # never NaN (breaks silx)
+        assert np.isfinite(rgb[1, 1]).all()          # on-grain keeps stamp colour
+
+
 # ------------------------------ standalone --------------------------------- #
 
 
@@ -661,6 +798,7 @@ def test_silx_can_parse(tmp_path):
     from silx.io.nxdata import get_default
 
     p = _save(tmp_path, _gaussnd())
-    default = get_default(p)
-    assert default is not None  # silx resolved entry@default -> a valid NXdata
-    assert default.signal is not None
+    with h5py.File(p) as f:  # silx get_default wants a group, not a path
+        default = get_default(f)
+        assert default is not None  # silx resolved entry@default -> a valid NXdata
+        assert default.signal is not None

@@ -5,6 +5,7 @@ tests/test_analyze_dispatch.py) or with a stub reader carrying scan_params,
 so no h5 master files are needed.
 """
 
+import h5py
 import numpy as np
 import pytest
 
@@ -201,6 +202,8 @@ def test_dense_roundtrip(tmp_path):
     assert b.attrs["masked_only"] is False or b.attrs["masked_only"] == 0
     assert b.detector_shape == (NY, NX)
     assert b.motor_shape == MOTOR_SHAPE
+    # a bundle written without save_raw_crop has no raw cube
+    assert b.raw_data is None
 
 
 def test_dense_roundtrip_no_reader_no_compression(tmp_path):
@@ -296,6 +299,140 @@ def test_masked_only_requires_a_mask(tmp_path):
     with pytest.raises(ValueError, match="mask"):
         save_bundle(str(tmp_path / "b.h5"), ds, masked_only=True,
                     masks={"grain": np.ones((NY, NX), bool)})  # no sig_mask
+
+
+# ------------------------------ save_raw_crop ------------------------------ #
+
+
+def _write_mosa_master(path, scan_specs, det_shape=(44, 52),
+                       blob=(24, 32, 6000.0, 2.0), m=4, n=5):
+    """A synthetic BLISS-like fscan2d master readable by MosaScan.
+
+    Each scan's detector stack is a CONSTANT image across all frames (a low
+    ``base`` pedestal + an off-centre bright Gaussian ``blob``), so the frame
+    permutation is irrelevant to pixel values and the raw cube can be verified
+    by cropping the base image at a known absolute ROI. ``scan_specs`` maps
+    ``scan_id -> (obpitch_value, base_level)``.
+    """
+    ny, nx = det_shape
+    br, bc, amp, sigma = blob
+    yy, xx = np.mgrid[0:ny, 0:nx]
+    g2d = amp * np.exp(-((yy - br) ** 2 + (xx - bc) ** 2) / (2 * sigma ** 2))
+    with h5py.File(path, "w") as f:
+        for sid, (obp, base) in scan_specs.items():
+            g = f.create_group(sid)
+            g["title"] = f"fscan2d chi -1.0 0.05 {m} mu 2.0 0.01 {n} 0.1"
+            chi = np.zeros((m, n))
+            mu = np.zeros((m, n))
+            for i in range(m):
+                sweep = 2.0 + 0.01 * np.arange(n)
+                if i % 2 == 1:
+                    sweep = sweep[::-1]  # snake
+                chi[i] = -1.0 + 0.05 * i
+                mu[i] = sweep
+            g["instrument/chi/value"] = chi.ravel()
+            g["instrument/mu/data"] = mu.ravel()
+            g["instrument/positioners/mu"] = 2.05
+            g["instrument/positioners/obpitch"] = obp
+            image = np.clip(base + g2d, 0, 65535).astype(np.uint16)
+            data = np.broadcast_to(image, (m * n, ny, nx)).astype(np.uint16)
+            g.create_dataset("instrument/pco_ff/image", data=data,
+                             chunks=(1, ny, nx))
+    return path
+
+
+def _base_image(path, sid):
+    """The (constant) raw detector image of one scan, read straight from h5."""
+    with h5py.File(path, "r") as f:
+        return f[f"{sid}/instrument/pco_ff/image"][0].astype(np.uint16)
+
+
+def test_raw_crop_roundtrip_composes_two_crops(tmp_path):
+    """save_raw_crop stores the RAW (pre-subtract) values at the composed
+    LOAD_ROI + auto_roi ROI — verified against an independently-computed ROI."""
+    h5 = str(tmp_path / "master.h5")
+    _write_mosa_master(h5, {"1.1": (0.2, 40)})
+    LOAD_ROI = (8, 36, 12, 46)
+
+    ds = DataSet(h5, scan_id="1.1", roi=LOAD_ROI, device="cpu", verbose=False)
+    # crop to the off-centre blob (a genuine second crop on top of LOAD_ROI)
+    local = ds.auto_roi(threshold_rel=0.05, pad=4)
+    lr1, lr2, lc1, lc2 = local
+    # the TRUE absolute ROI, composed here without trusting final_roi()
+    true_abs = (LOAD_ROI[0] + lr1, LOAD_ROI[0] + lr2,
+                LOAD_ROI[2] + lc1, LOAD_ROI[2] + lc2)
+    assert ds.final_roi() == true_abs          # final_roi composes correctly
+    assert true_abs != LOAD_ROI                # the second crop actually bit
+
+    ds.subtract(30)                            # processed data now != raw
+    p = str(tmp_path / "b.h5")
+    save_bundle(p, ds, save_raw_crop=True)
+    b = load_bundle(p)
+
+    assert b.raw_data is not None
+    assert b.raw_data.dtype == np.uint16
+    assert b.raw_data.shape == b.data.shape
+    # independently: crop the base image at the true composed ROI
+    r1, r2, c1, c2 = true_abs
+    expected2d = _base_image(h5, "1.1")[r1:r2, c1:c2]
+    assert np.array_equal(b.raw_data, np.broadcast_to(
+        expected2d[:, :, None, None], b.raw_data.shape))
+    # raw really is pre-subtraction (differs from the stored, processed cube)
+    assert np.any(b.raw_data != b.data)
+    # ROI recorded on the dataset attr + in provenance
+    assert list(b.attrs["raw_crop_roi"]) == list(true_abs)
+
+
+def test_raw_crop_stacked_preserves_stack_order(tmp_path):
+    """Stacked raw cube is assembled in the loaded cube's (obp-sorted) order,
+    catching the scan_id-ordering bug."""
+    h5 = str(tmp_path / "master.h5")
+    # obp deliberately unsorted; distinct base levels identify each sub-scan
+    specs = {"1.1": (0.30, 100), "2.1": (0.10, 200), "3.1": (0.20, 300)}
+    _write_mosa_master(h5, specs)
+    LOAD_ROI = (8, 36, 12, 46)
+
+    ds = DataSet(h5, scan_id=["1.1", "2.1", "3.1"],
+                 scan_motor="instrument/positioners/obpitch",
+                 roi=LOAD_ROI, device="cpu", verbose=False)
+    local = ds.auto_roi(threshold_rel=0.05, pad=4)
+    lr1, lr2, lc1, lc2 = local
+    r1, r2 = LOAD_ROI[0] + lr1, LOAD_ROI[0] + lr2
+    c1, c2 = LOAD_ROI[2] + lc1, LOAD_ROI[2] + lc2
+
+    ds.subtract(50)
+    p = str(tmp_path / "b.h5")
+    save_bundle(p, ds, save_raw_crop=True)
+    b = load_bundle(p)
+
+    assert b.raw_data is not None
+    assert b.raw_data.shape == b.data.shape
+    # loaded stack axis is sorted by obp: 2.1 (0.10), 3.1 (0.20), 1.1 (0.30)
+    order = ["2.1", "3.1", "1.1"]
+    for k, sid in enumerate(order):
+        expected2d = _base_image(h5, sid)[r1:r2, c1:c2]
+        assert np.array_equal(
+            b.raw_data[..., k],
+            np.broadcast_to(expected2d[:, :, None, None], b.raw_data[..., k].shape),
+        ), f"stack layer {k} != scan {sid}"
+    assert np.any(b.raw_data != b.data)
+
+
+def test_raw_crop_requires_builtin_reader(tmp_path):
+    ds = _dset()  # _StubReader, not a built-in scan reader
+    with pytest.raises(ValueError, match="save_raw_crop requires"):
+        save_bundle(str(tmp_path / "b.h5"), ds, save_raw_crop=True)
+
+
+def test_raw_crop_rejects_partial_scan(tmp_path):
+    from starling.io._dataset import _PartialScan
+
+    ds = _dset()
+    ds.reader = _PartialScan(ds.data, ds.motors, ds.h5file, "1.1",
+                             {"complete": False})
+    ds.scan_id = "1.1"
+    with pytest.raises(ValueError, match="save_raw_crop requires"):
+        save_bundle(str(tmp_path / "b.h5"), ds, save_raw_crop=True)
 
 
 # ------------------------------ support_count ------------------------------ #
