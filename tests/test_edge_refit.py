@@ -116,3 +116,50 @@ def test_classifier_negative_amplitude_never_ok():
     st3 = classify_fit_status(mu[..., None][..., 0], success, [(0.0, 1.0)], [0.05],
                               A=np.array([[100.0]]))
     assert st3[0, 0] == OK
+
+
+def test_gated_moment_resists_baseline_drag():
+    from starling.properties._refit import _gated_moment
+
+    rng = np.random.default_rng(3)
+    n = 20000  # real cubes have ~20k voxels: aggregate baseline outweighs a spike
+    x = np.linspace(0.0, 1.0, n)[:, None]
+    # flat Poisson baseline + a sharp 2-point spike at the top edge
+    y = rng.poisson(50, size=(1, n)).astype(float)
+    y[0, -2:] += (20000.0, 30000.0)
+    mu, A0, base = _gated_moment(y, x)
+    # plain moment is dragged toward mid-window by baseline residuals; the
+    # gated one must sit at the spike
+    plain = ((y[0] - np.percentile(y[0], 20)).clip(0) @ x[:, 0]) / \
+            (y[0] - np.percentile(y[0], 20)).clip(0).sum()
+    assert abs(plain - 0.5) < 0.2           # demonstrates the drag
+    assert mu[0, 0] > 0.95                  # gated moment sits at the spike
+    assert A0[0] > 1000
+
+
+def test_fallback_tier_covers_all_targets():
+    data, coords, cov, c0, m0 = _truncated_mosa()
+    ny, nx = data.shape[:2]
+    # everything flagged FAILED with garbage free-fit values
+    res = GaussNDResult(
+        A=np.full((ny, nx), -1.0), mu=np.full((ny, nx, 2), 99.0),
+        cov=np.broadcast_to(np.eye(2) * 1e-8, (ny, nx, 2, 2)).copy(),
+        c=np.zeros((ny, nx)), success=np.zeros((ny, nx)),
+    )
+    status = np.full((ny, nx), FAILED, dtype=np.int8)
+    merged, rmask, source = refit_edge_pixels(
+        data, coords, res, status, cov=cov, device="cpu", return_source=True
+    )
+    # with the fallback tier every target carries a value
+    assert rmask.all()
+    assert set(np.unique(source[rmask])) <= {2, 3}
+    # all centres inside window + margin
+    for i in range(2):
+        g = np.unique(coords[i])
+        step = np.median(np.diff(g))
+        assert (merged.mu[..., i] >= g.min() - 8 * step - 1e-9).all()
+        assert (merged.mu[..., i] <= g.max() + 8 * step + 1e-9).all()
+    # disabling the fallback reverts to GN-only coverage
+    _, rmask2 = refit_edge_pixels(data, coords, res, status, cov=cov,
+                                  device="cpu", fallback=None)
+    assert rmask2.sum() <= rmask.sum()

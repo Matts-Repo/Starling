@@ -31,6 +31,41 @@ import numpy as np
 from ._results import GaussNDResult
 
 
+def _gated_moment(y, X, base_pct=20.0, nsigma=5.0):
+    """Noise-gated weighted first moment per pixel.
+
+    A plain background-subtracted moment is dragged toward the window centre
+    by residual baseline noise (thousands of small positive weights across
+    the grid can outweigh a sharp 2-3 point peak). Gating the weights at
+    ``base + nsigma*sqrt(base)`` (Poisson-scale) keeps only genuine peak
+    voxels, which is what makes the moment usable as a centre estimate for
+    severely truncated peaks. This is darfix's moment-fallback idea with a
+    noise gate added.
+
+    Args:
+        y (numpy.ndarray): (P, N) per-pixel curves.
+        X (numpy.ndarray): (N, D) motor coordinates.
+        base_pct (float): percentile used as the baseline estimate.
+        nsigma (float): gate at base + nsigma*sqrt(base + 1).
+
+    Returns:
+        tuple: mu (P, D) gated-moment centres (argmax voxel where nothing
+        passes the gate), A0 (P,) max-minus-baseline, c0 (P,) baseline.
+    """
+    base = np.percentile(y, base_pct, axis=1)
+    thr = base + nsigma * np.sqrt(np.clip(base, 0.0, None) + 1.0)
+    w = np.where(y > thr[:, None], y - base[:, None], 0.0)
+    wsum = w.sum(axis=1)
+    mu = np.empty((y.shape[0], X.shape[1]))
+    ok = wsum > 0
+    if ok.any():
+        mu[ok] = (w[ok] @ X) / wsum[ok, None]
+    if (~ok).any():
+        mu[~ok] = X[np.argmax(y[~ok], axis=1)]
+    A0 = np.clip(y.max(axis=1) - base, 1e-3, None)
+    return mu, A0, base
+
+
 def median_healthy_cov(result, status, sigma_range=(1e-3, None)):
     """Grain-median covariance from strictly-healthy fitted pixels.
 
@@ -141,15 +176,15 @@ def fit_ND_fixed_cov(data, coordinates, cov, mask, device=None, n_iter=30,
         ys = np.maximum(y.max(axis=1), 1.0)
         yn = y / ys[:, None]
 
-        # seeds: per-axis marginal argmax (host, cheap) + low-percentile bg
+        # seeds: per-axis marginal argmax + low-percentile bg. (Gated-moment
+        # seeds were tried and moved ~10% of pixels from the validated GN tier
+        # into the fallback tier on real data — argmax seeds converge more.)
         seed_mu = np.empty((len(sel), D))
         patch = y.reshape(len(sel), *data.shape[2:])
         for i in range(D):
             other = tuple(1 + j for j in range(D) if j != i)
             prof = patch.sum(axis=other)
             am = prof.argmax(axis=1)
-            gvals = np.unique(coordinates[i].ravel())
-            # map argmax index onto the sorted axis values via the actual grid
             axis_vals = np.moveaxis(coordinates[i], i, 0).reshape(data.shape[2 + i], -1)[:, 0]
             seed_mu[:, i] = (axis_vals[am] - xc[i]) / xs[i]
         c0 = np.percentile(yn, 20, axis=1)
@@ -174,7 +209,8 @@ def fit_ND_fixed_cov(data, coordinates, cov, mask, device=None, n_iter=30,
 
 
 def refit_edge_pixels(data, coordinates, result, status, cov=None, device=None,
-                      n_iter=30, mu_pad_steps=8.0, chunk_px=1024):
+                      n_iter=30, mu_pad_steps=8.0, chunk_px=1024,
+                      fallback="moments", return_source=False):
     """Constrained refit of EDGE_CLIPPED/FAILED pixels; returns merged result.
 
     Pixels with ``status`` 2 (edge-clipped) or 3 (failed) are refit with the
@@ -193,9 +229,18 @@ def refit_edge_pixels(data, coordinates, result, status, cov=None, device=None,
         cov (numpy.ndarray, optional): (D, D) fixed covariance override.
         device, n_iter, mu_pad_steps, chunk_px: see :func:`fit_ND_fixed_cov`.
 
+    Pixels where even the constrained fit fails get a ``fallback``
+    estimate (default "moments"): the noise-gated weighted first moment of
+    the raw curve, clamped to the scan window plus margin — darfix writes
+    its (ungated) moment seed into the maps silently on fit failure; here
+    the same idea is gated against baseline drag and flagged. ``None``
+    disables the fallback tier.
+
     Returns:
-        tuple: (merged GaussNDResult, refit_mask (ny, nx) bool — True where
-        the refit converged and replaced the original values).
+        tuple: (merged GaussNDResult, refit_mask (ny, nx) bool — True where a
+        replacement value landed). With ``return_source=True`` a third
+        (ny, nx) int8 array: 0 untouched, 2 constrained refit, 3 moment
+        fallback.
     """
     status = np.asarray(status)
     target = (status == 2) | (status == 3)
@@ -208,16 +253,41 @@ def refit_edge_pixels(data, coordinates, result, status, cov=None, device=None,
         cov=np.array(result.cov, copy=True), c=np.array(result.c, copy=True),
         success=np.array(result.success, copy=True),
     )
+    source = np.zeros(target.shape, dtype=np.int8)
     if not target.any():
-        return out, np.zeros_like(target)
+        return (out, target.copy(), source) if return_source else (out, target.copy())
 
     fit = fit_ND_fixed_cov(
         data, coordinates, cov, target, device=device, n_iter=n_iter,
         mu_pad_steps=mu_pad_steps, chunk_px=chunk_px,
     )
-    refit_mask = target & (fit["success"] > 0.5) & (fit["A"] > 0)
-    out.A[refit_mask] = fit["A"][refit_mask]
-    out.mu[refit_mask] = fit["mu"][refit_mask]
-    out.c[refit_mask] = fit["c"][refit_mask]
-    out.cov[refit_mask] = cov  # the prior, flagged via refit_mask
-    return out, refit_mask
+    refit_ok = target & (fit["success"] > 0.5) & (fit["A"] > 0)
+    out.A[refit_ok] = fit["A"][refit_ok]
+    out.mu[refit_ok] = fit["mu"][refit_ok]
+    out.c[refit_ok] = fit["c"][refit_ok]
+    out.cov[refit_ok] = cov  # the prior, flagged via refit_mask/source
+    source[refit_ok] = 2
+
+    leftover = target & ~refit_ok
+    if fallback == "moments" and leftover.any():
+        ny, nx = target.shape
+        D = np.asarray(coordinates).shape[0]
+        X = np.asarray(coordinates, dtype=np.float64).reshape(D, -1).T
+        idx = np.argwhere(leftover)
+        y = data.reshape(ny, nx, -1)[idx[:, 0], idx[:, 1]].astype(np.float64)
+        mu_m, A0, base = _gated_moment(y, X)
+        # clamp into the scan window + the same margin the refit allows
+        for i in range(D):
+            vals = np.unique(np.asarray(coordinates)[i].ravel())
+            d = np.diff(vals)
+            step = float(np.median(d[d > 0])) if (d > 0).any() else 0.0
+            pad = mu_pad_steps * step
+            mu_m[:, i] = np.clip(mu_m[:, i], vals[0] - pad, vals[-1] + pad)
+        out.A[idx[:, 0], idx[:, 1]] = A0
+        out.mu[idx[:, 0], idx[:, 1]] = mu_m
+        out.c[idx[:, 0], idx[:, 1]] = base
+        out.cov[idx[:, 0], idx[:, 1]] = cov
+        source[idx[:, 0], idx[:, 1]] = 3
+
+    refit_mask = source > 0
+    return (out, refit_mask, source) if return_source else (out, refit_mask)
