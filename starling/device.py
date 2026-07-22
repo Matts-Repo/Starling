@@ -10,6 +10,17 @@ import os
 import psutil
 import torch
 
+# Tensor-core TF32 matmuls on Ampere+ GPUs: 2-4x on the batched J^T J
+# GEMMs inside the fits at fit-irrelevant precision cost (fp32 accumulate,
+# parameters converge to the same xtol band). The analysis notebooks set
+# this too; setting it here covers batch/CLI runs. Opt out with
+# STARLING_TF32=0.
+if os.environ.get("STARLING_TF32", "1") not in ("0", "false", "False"):
+    try:
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
+
 
 def get_device(prefer=None):
     """Resolve the compute device.

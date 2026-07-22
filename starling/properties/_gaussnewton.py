@@ -7,12 +7,30 @@ The per-iteration step is torch.compile'd: the model/Jacobian evaluation is a
 chain of memory-bound elementwise kernels that fusion speeds up ~10x on MPS.
 """
 
+import os
+
 import torch
 
 from ._solve import solve_spd
 
 _STEP_CACHE = {}
 _STEP_CACHE_LAM = {}
+
+
+def _should_compile(device):
+    """torch.compile the per-iteration step for this backend?
+
+    Measured on real hardware: on MPS the fused kernels are ~10x faster
+    than eager, but on CUDA (A40, torch 2.4/inductor) eager BEATS the
+    compiled step (89 s vs 95-100 s warm for a 19k-px 3D fit) while
+    compilation additionally costs ~40 s on first use and ~5 s per new
+    chunk shape. Default: compile everywhere except CUDA; override with
+    STARLING_TORCH_COMPILE=1/0.
+    """
+    env = os.environ.get("STARLING_TORCH_COMPILE")
+    if env is not None:
+        return env not in ("0", "false", "False")
+    return device.type != "cuda"
 
 
 def _gn_step(y, x, params, lam, model_and_jac):
@@ -38,12 +56,15 @@ def _get_step(model_and_jac, device):
     key = (model_and_jac, device.type)
     if key not in _STEP_CACHE:
         fn = lambda y, x, params, lam: _gn_step(y, x, params, lam, model_and_jac)
-        try:
-            # static shapes compile ~4x faster kernels on MPS than dynamic=True;
-            # callers keep chunk shapes uniform so each shape compiles once
-            _STEP_CACHE[key] = torch.compile(fn)
-        except Exception:
-            _STEP_CACHE[key] = fn
+        if _should_compile(device):
+            try:
+                # static shapes compile ~4x faster kernels on MPS than
+                # dynamic=True; callers keep chunk shapes uniform so each
+                # shape compiles once
+                fn = torch.compile(fn)
+            except Exception:
+                pass
+        _STEP_CACHE[key] = fn
     return _STEP_CACHE[key]
 
 
@@ -51,10 +72,12 @@ def _get_step_lam(model_and_jac, device):
     key = (model_and_jac, device.type)
     if key not in _STEP_CACHE_LAM:
         fn = lambda y, x, params, lam: _gn_step_lam(y, x, params, lam, model_and_jac)
-        try:
-            _STEP_CACHE_LAM[key] = torch.compile(fn)
-        except Exception:
-            _STEP_CACHE_LAM[key] = fn
+        if _should_compile(device):
+            try:
+                fn = torch.compile(fn)
+            except Exception:
+                pass
+        _STEP_CACHE_LAM[key] = fn
     return _STEP_CACHE_LAM[key]
 
 
@@ -75,7 +98,7 @@ def _rel_step_done(delta, params, xtol):
 def gauss_newton_batched(
     y, x, params0, model_and_jac, n_iter=7, lam=1e-4, bounds=None,
     adaptive=False, lam_up=4.0, lam_down=0.5, lam_min=1e-6, lam_max=1e3,
-    xtol=1e-5, freeze_fn=None,
+    xtol=1e-5, freeze_fn=None, iter_cb=None,
 ):
     """Fit a batch of curves with damped Gauss-Newton.
 
@@ -113,6 +136,8 @@ def gauss_newton_batched(
         xtol (float, optional): relative step-size convergence tolerance.
             ``None`` disables early termination entirely (legacy fixed-count
             behaviour).
+        iter_cb (callable, optional): called once after every completed
+            iteration (live progress reporting from callers).
         freeze_fn (callable, optional): ``params (P, p) -> (P,) bool`` marking
             pixels whose parameters have become hopeless (e.g. a fitted centre
             far outside the scan window). Frozen alongside converged pixels so
@@ -146,6 +171,8 @@ def gauss_newton_batched(
             if bounds is not None:
                 params = torch.clamp(params, bounds[0], bounds[1])
             success = success & (ok | done)
+            if iter_cb is not None:
+                iter_cb()
             if xtol is not None:
                 done = done | (active & _rel_step_done(delta, params, xtol)) | ~success
                 if freeze_fn is not None:
@@ -183,6 +210,8 @@ def gauss_newton_batched(
             params = torch.clamp(params, bounds[0], bounds[1])
         lam_vec = torch.where(good | done, lam_vec * lam_down, lam_vec * lam_up)
         lam_vec = lam_vec.clamp(lam_min, lam_max)
+        if iter_cb is not None:
+            iter_cb()
         if xtol is not None:
             done = done | (good & _rel_step_done(delta, params, xtol))
             # a pixel whose solve failed AT maximum damping is deterministically

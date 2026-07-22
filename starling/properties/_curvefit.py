@@ -567,10 +567,16 @@ def _fit_ND_engine(data, coordinates, n_iter_gauss_newton, mask, device,
         # is a runaway (truncated-peak divergence) that would otherwise keep
         # the whole chunk iterating. Per-pixel -> batch-invariant.
         _esc = lambda p: (p[:, 1:1 + D].abs() > 8.0).any(-1)
+        # live progress: advance the bar fractionally per solver iteration,
+        # then snap to the chunk boundary (early-stopped chunks jump ahead)
+        _step_px = len(sel) / max(n_iter_gauss_newton, 1)
         params, ok = gauss_newton_batched(
             yn, ch, p0, model, n_iter=n_iter_gauss_newton, lam=lam,
             adaptive=adaptive, xtol=xtol, freeze_fn=_esc,
+            iter_cb=lambda: pbar.update(_step_px),
         )
+        pbar.n = min(lo + len(sel), pbar.total or 0)
+        pbar.refresh()
         ok = ok & ~degenerate
 
         # --- un-transform back to motor units ---
@@ -608,7 +614,6 @@ def _fit_ND_engine(data, coordinates, n_iter_gauss_newton, mask, device,
         out_cov[sel] = cov_f[keep]
         out_c[sel] = c_f[keep]
         out_s[sel] = ok_np[keep].astype(float)
-        pbar.update(len(sel))
 
     pbar.close()
     return {
@@ -1010,9 +1015,11 @@ def fit_ND_two_gaussians(
         )
         p2_0 = torch.as_tensor(seed2, dtype=dtype).to(dev)
 
+        _step_px2 = n_sel / max(n_iter_gauss_newton, 1)
         p2, ok2_t = gauss_newton_batched(
             yn, ch, p2_0, model2, n_iter=n_iter_gauss_newton, lam=lam,
             adaptive=adaptive, bounds=(lo_b, hi_b),
+            iter_cb=lambda: pbar.update(_step_px2),
         )
         ok2_np = (ok2_t & ~degenerate).cpu().numpy()
         f2, _ = model2(p2, ch)
@@ -1100,7 +1107,8 @@ def fit_ND_two_gaussians(
         out_b1[sel] = bic1_np[keep]
         out_b2[sel] = bic2_np[keep]
         out_s[sel] = two[keep].astype(float)
-        pbar.update(n_sel)
+        pbar.n = min(lo_i + n_sel, pbar.total or 0)
+        pbar.refresh()
 
     pbar.close()
     return GaussNDTwoResult(
