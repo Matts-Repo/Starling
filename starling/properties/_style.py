@@ -90,16 +90,19 @@ def robust_limits(arr, ok=None, n_sigma=3.0, symmetric=False):
 
 def imshow_map(ax, arr, fit_status=None, cmap="viridis", vmin=None, vmax=None,
                colorbar=True, cbar_label=None, show_clamped=None,
-               edge_outline=True, extent=None, **kw):
+               edge_outline=True, extent=None, refit_mask=None, **kw):
     """Standard starling map display with fit-status-aware rendering.
 
     Rendering convention (when ``fit_status`` is given):
 
     * ``OK`` — normal colormap.
     * ``EDGE_CLIPPED`` — shown with the value in ``show_clamped`` (e.g. a
-      range-clamped centre estimate) when provided, else hidden like FAILED;
-      the region is outlined in orange either way.
-    * ``FAILED`` — flat darker grey.
+      constrained-refit or range-clamped estimate) when provided, else hidden
+      like FAILED; the region is outlined in orange either way.
+    * ``FAILED`` — flat darker grey, UNLESS the pixel is in ``refit_mask``
+      (a replacement estimate exists): then it displays its ``show_clamped``
+      value and joins the orange outline. Dark grey therefore means "no
+      value at all", never "value hidden by classification".
     * ``NO_SIGNAL`` — light grey background.
 
     Without ``fit_status``, NaN pixels render light grey.
@@ -126,14 +129,16 @@ def imshow_map(ax, arr, fit_status=None, cmap="viridis", vmin=None, vmax=None,
     cmap = DEFAULT_CMAPS.get(cmap, cmap)
     cm = status_cmap(cmap)
 
+    rmask = (np.zeros(np.asarray(arr).shape, bool) if refit_mask is None
+             else np.asarray(refit_mask, dtype=bool))
     disp = np.array(arr, dtype=float, copy=True)
     if fit_status is not None:
         st = np.asarray(fit_status)
         disp[st == NO_SIGNAL] = np.nan
         disp[st == FAILED] = np.nan
         if show_clamped is not None:
-            edge = st == EDGE_CLIPPED
-            disp[edge] = np.asarray(show_clamped, dtype=float)[edge]
+            fill = (st == EDGE_CLIPPED) | rmask
+            disp[fill] = np.asarray(show_clamped, dtype=float)[fill]
         else:
             disp[st == EDGE_CLIPPED] = np.nan
 
@@ -141,15 +146,16 @@ def imshow_map(ax, arr, fit_status=None, cmap="viridis", vmin=None, vmax=None,
 
     if fit_status is not None:
         st = np.asarray(fit_status)
-        # failed pixels: darker grey layer on top of the bad-color background
-        failed = st == FAILED
+        # dark grey ONLY where no replacement value exists
+        failed = (st == FAILED) & ~rmask
         if failed.any():
             overlay = np.zeros((*st.shape, 4))
             overlay[failed] = plt.matplotlib.colors.to_rgba(FAILED_COLOR)
             ax.imshow(overlay, extent=extent, interpolation="nearest")
-        if edge_outline and (st == EDGE_CLIPPED).any():
+        outlined = (st == EDGE_CLIPPED) | rmask
+        if edge_outline and outlined.any():
             ax.contour(
-                (st == EDGE_CLIPPED).astype(float),
+                outlined.astype(float),
                 levels=[0.5],
                 colors=[EDGE_OUTLINE],
                 linewidths=0.8,

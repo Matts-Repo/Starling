@@ -769,6 +769,56 @@ def grain_mask(data, threshold_rel=0.05, method="fraction", close=2, fill=True):
     return mask.astype(bool)
 
 
+def grain_mask_robust(data, zsum_threshold=None, peak_threshold=None,
+                      close=2, fill=True, return_thresholds=False):
+    """Truncation-insensitive grain mask: z-sum Otsu OR peak-voxel Otsu.
+
+    A z-sum threshold alone systematically excludes grain regions whose peaks
+    are clipped by the scan range: truncation halves the INTEGRATED intensity
+    while the single brightest voxel stays bright (measured on MA7031
+    FN1_BC_001: 5,212 grain px with median peak voxel ~1,400 counts sat below
+    the z-sum Otsu threshold — the "grey blobs" on the truncated side). The
+    union with a peak-height criterion (Otsu on log10 of the per-pixel max
+    voxel) keeps those pixels while the log transform keeps the noise/grain
+    separation clean.
+
+    Args:
+        data (numpy.ndarray): shape (a, b, ...).
+        zsum_threshold (float, optional): absolute z-sum counts; None = Otsu.
+        peak_threshold (float, optional): absolute peak-voxel counts;
+            None = Otsu on log10(max + 1).
+        close (int): binary-closing iterations (0 disables).
+        fill (bool): fill interior holes.
+        return_thresholds (bool): also return (zsum_thr, peak_thr).
+
+    Returns:
+        numpy.ndarray: (a, b) bool mask — or ``(mask, zsum_thr, peak_thr)``
+        with ``return_thresholds=True``.
+    """
+    a, b = data.shape[:2]
+    flat = data.reshape(a, b, -1)
+    zsum = flat.sum(axis=-1, dtype=np.float64)
+    cmax = flat.max(axis=-1).astype(np.float64)
+    thr_z = float(zsum_threshold) if zsum_threshold is not None else _otsu_threshold(zsum)
+    if peak_threshold is not None:
+        thr_p = float(peak_threshold)
+    else:
+        thr_p = 10.0 ** _otsu_threshold(np.log10(cmax + 1.0))
+    mask = (zsum > thr_z) | (cmax > thr_p)
+    if close and close > 0:
+        from scipy.ndimage import binary_closing
+
+        mask = binary_closing(mask, iterations=int(close))
+    if fill:
+        from scipy.ndimage import binary_fill_holes
+
+        mask = binary_fill_holes(mask)
+    mask = mask.astype(bool)
+    if return_thresholds:
+        return mask, thr_z, thr_p
+    return mask
+
+
 def polygon_mask(shape, vertices):
     """Rasterise a polygon outline to a boolean mask.
 

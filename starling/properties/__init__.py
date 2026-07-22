@@ -18,7 +18,8 @@ from ._diagnostics import (
     motor_ranges_steps,
 )
 from ._maps import mosaicity, orientation_map, orientation_stamp
-from ._refit import fit_ND_fixed_cov, median_healthy_cov, refit_edge_pixels
+from ._refit import (fit_ND_fixed_cov, median_healthy_cov,
+                     refit_edge_pixels, refit_status_update)
 from ._style import (
     DEFAULT_CMAPS,
     imshow_map,
@@ -60,6 +61,7 @@ __all__ = [
     "clamp_edge_estimate",
     "edge_peak_mask",
     "refit_edge_pixels",
+    "refit_status_update",
     "fit_ND_fixed_cov",
     "median_healthy_cov",
     "motor_ranges_steps",

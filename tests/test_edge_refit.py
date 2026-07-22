@@ -163,3 +163,47 @@ def test_fallback_tier_covers_all_targets():
     _, rmask2 = refit_edge_pixels(data, coords, res, status, cov=cov,
                                   device="cpu", fallback=None)
     assert rmask2.sum() <= rmask.sum()
+
+
+def test_width_refinement_recovers_contained_axis_widths():
+    """Stage 2 must recover per-pixel chi widths (contained axis) even though
+    the prior covariance carries a single grain-median width."""
+    rng = np.random.default_rng(7)
+    ny, nx, nchi, nmu = 5, 8, 30, 34
+    chi = np.linspace(0.0, 1.0, nchi)
+    mu = np.linspace(0.0, 1.0, nmu)[:28]     # mu truncated at the top
+    CHI, MU = np.meshgrid(chi, mu, indexing="ij")
+    s_mu = 0.06
+    s_chi_true = rng.uniform(0.05, 0.20, (ny, nx))   # per-pixel chi widths
+    c0 = rng.uniform(0.35, 0.65, (ny, nx))
+    m0 = rng.uniform(0.85, 0.95, (ny, nx))           # at/beyond the mu edge
+    data = np.empty((ny, nx, nchi, len(mu)))
+    for j in range(ny):
+        for i in range(nx):
+            g = 5000 * np.exp(-0.5 * (((CHI - c0[j, i]) / s_chi_true[j, i]) ** 2
+                                      + ((MU - m0[j, i]) / s_mu) ** 2))
+            data[j, i] = rng.poisson(g + 12)
+    coords = np.array(np.meshgrid(chi, mu, indexing="ij"))
+    prior = np.diag([0.10 ** 2, s_mu ** 2])   # grain-median chi width: 0.10
+
+    res = GaussNDResult(
+        A=np.full((ny, nx), -1.0), mu=np.full((ny, nx, 2), 99.0),
+        cov=np.broadcast_to(prior, (ny, nx, 2, 2)).copy(),
+        c=np.zeros((ny, nx)), success=np.zeros((ny, nx)),
+    )
+    status = np.full((ny, nx), FAILED, dtype=np.int8)
+
+    merged, rmask, source = refit_edge_pixels(
+        data.astype(np.uint16), coords, res, status, cov=prior, device="cpu",
+        return_source=True,
+    )
+    ok = source == 2
+    assert ok.mean() > 0.8
+    s_chi_fit = np.sqrt(merged.cov[..., 0, 0])
+    rel = np.abs(s_chi_fit - s_chi_true)[ok] / s_chi_true[ok]
+    # widths measurably per-pixel, not stuck at the 0.10 prior
+    assert np.median(rel) < 0.25
+    spread = np.std(s_chi_fit[ok])
+    assert spread > 0.02  # varies across pixels (prior would give spread 0)
+    # truncated mu axis keeps the prior width exactly
+    assert np.allclose(np.sqrt(merged.cov[ok][:, 1, 1]), s_mu, rtol=1e-6)

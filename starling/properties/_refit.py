@@ -66,6 +66,19 @@ def _gated_moment(y, X, base_pct=20.0, nsigma=5.0):
     return mu, A0, base
 
 
+def _per_axis_edge(data, edge_bins=3):
+    """(ny, nx, D) bool: per-AXIS truncation flags (argmax near that axis's end)."""
+    n_motor = data.ndim - 2
+    out = np.zeros((*data.shape[:2], n_motor), dtype=bool)
+    for ax in range(n_motor):
+        n = data.shape[2 + ax]
+        other = tuple(2 + i for i in range(n_motor) if i != ax)
+        prof = data.sum(axis=other, dtype=np.int64)
+        am = np.argmax(prof, axis=-1)
+        out[..., ax] = (am < edge_bins) | (am >= n - edge_bins)
+    return out
+
+
 def median_healthy_cov(result, status, sigma_range=(1e-3, None)):
     """Grain-median covariance from strictly-healthy fitted pixels.
 
@@ -91,7 +104,8 @@ def median_healthy_cov(result, status, sigma_range=(1e-3, None)):
 
 
 def fit_ND_fixed_cov(data, coordinates, cov, mask, device=None, n_iter=30,
-                     mu_pad_steps=8.0, chunk_px=1024):
+                     mu_pad_steps=8.0, chunk_px=1024, free_scale_axes=(),
+                     scale_range=(0.25, 4.0)):
     """Batched N-D Gaussian fit with a FIXED covariance (A, mu, c free).
 
     Args:
@@ -104,9 +118,16 @@ def fit_ND_fixed_cov(data, coordinates, cov, mask, device=None, n_iter=30,
         mu_pad_steps (float): centre bound margin beyond the scan window, in
             motor grid steps per axis.
         chunk_px (int): pixels per device batch.
+        free_scale_axes (sequence): axes whose width may deviate from the
+            prior via a fitted per-pixel scale factor (bounded to
+            ``scale_range``); other axes keep the prior width exactly. Free
+            only axes whose peak is fully contained — on a truncated axis
+            width and centre are degenerate.
+        scale_range (tuple): (lo, hi) bounds for the free width scales.
 
     Returns:
-        dict: A, mu, c (masked pixels filled, others zero), success (ny, nx).
+        dict: A, mu, c (masked pixels filled, others zero), success (ny, nx),
+        scale (ny, nx, D) fitted per-axis width scales (1.0 where fixed).
     """
     import torch
 
@@ -143,32 +164,52 @@ def fit_ND_fixed_cov(data, coordinates, cov, mask, device=None, n_iter=30,
     P = len(idx)
     A_out = np.zeros((ny, nx)); c_out = np.zeros((ny, nx))
     mu_out = np.zeros((ny, nx, D)); success = np.zeros((ny, nx))
+    scale_out = np.ones((ny, nx, D))
     if P == 0:
-        return {"A": A_out, "mu": mu_out, "c": c_out, "success": success}
+        return {"A": A_out, "mu": mu_out, "c": c_out, "success": success,
+                "scale": scale_out}
 
     Sinv_t = torch.as_tensor(Sinv_w, dtype=dtype, device=dev)
     xh_t = torch.as_tensor(xh, dtype=dtype, device=dev)  # (N, D)
 
+    free_idx = list(free_scale_axes)
+    K = len(free_idx)
+
     def model_and_jac(params, x):
-        # params (P, 2 + D): [A, mu_0..mu_{D-1}, c]
+        # params (P, 2 + D + K): [A, mu_0..mu_{D-1}, s_free_0..s_free_{K-1}, c]
+        # Only the free axes carry a fitted width scale — with K == 0 this is
+        # exactly the fixed-covariance model (no extra normal-equation load).
+        P_ = params.shape[0]
         A = params[:, 0:1]                       # (P, 1)
         mu = params[:, 1:1 + D]                  # (P, D)
-        c = params[:, 1 + D:2 + D]               # (P, 1)
-        d = x.unsqueeze(0) - mu.unsqueeze(1)     # (P, N, D)
+        c = params[:, 1 + D + K:2 + D + K]       # (P, 1)
+        if K:
+            sc = torch.ones(P_, D, dtype=params.dtype, device=params.device)
+            sc[:, free_idx] = params[:, 1 + D:1 + D + K]
+            d = (x.unsqueeze(0) - mu.unsqueeze(1)) / sc.unsqueeze(1)
+        else:
+            d = x.unsqueeze(0) - mu.unsqueeze(1)
         Sd = torch.einsum("ij,pnj->pni", Sinv_t, d)
         q = (d * Sd).sum(-1)                     # (P, N)
         e = torch.exp(-0.5 * q.clamp(max=60.0))
         f = A * e + c
-        J = torch.empty((*e.shape, 2 + D), dtype=e.dtype, device=e.device)
+        J = torch.empty((*e.shape, 2 + D + K), dtype=e.dtype, device=e.device)
         J[..., 0] = e
-        J[..., 1:1 + D] = (A * e).unsqueeze(-1) * Sd
-        J[..., 1 + D] = 1.0
+        Ae = (A * e).unsqueeze(-1)
+        if K:
+            J[..., 1:1 + D] = Ae * Sd / sc.unsqueeze(1)
+            J[..., 1 + D:1 + D + K] = (Ae * Sd * d)[..., free_idx] / \
+                sc[:, None, free_idx]
+        else:
+            J[..., 1:1 + D] = Ae * Sd
+        J[..., 1 + D + K] = 1.0
         return f, J
 
     flat = data.reshape(ny, nx, -1)
-    lo = torch.as_tensor(np.concatenate([[0.0], lo_mu, [0.0]]), dtype=dtype, device=dev)
+    s_lo = np.full(K, scale_range[0]); s_hi = np.full(K, scale_range[1])
+    lo = torch.as_tensor(np.concatenate([[0.0], lo_mu, s_lo, [0.0]]), dtype=dtype, device=dev)
     hi_c = 1.0  # normalized background can't exceed the per-pixel max
-    hi = torch.as_tensor(np.concatenate([[50.0], hi_mu, [hi_c]]), dtype=dtype, device=dev)
+    hi = torch.as_tensor(np.concatenate([[50.0], hi_mu, s_hi, [hi_c]]), dtype=dtype, device=dev)
 
     for k0 in range(0, P, chunk_px):
         sel = idx[k0:k0 + chunk_px]
@@ -189,7 +230,8 @@ def fit_ND_fixed_cov(data, coordinates, cov, mask, device=None, n_iter=30,
             seed_mu[:, i] = (axis_vals[am] - xc[i]) / xs[i]
         c0 = np.percentile(yn, 20, axis=1)
         A0 = np.clip(yn.max(axis=1) - c0, 1e-3, None)
-        p0 = np.concatenate([A0[:, None], seed_mu, c0[:, None]], axis=1)
+        s0 = np.ones((len(sel), K))
+        p0 = np.concatenate([A0[:, None], seed_mu, s0, c0[:, None]], axis=1)
 
         y_t = torch.as_tensor(yn, dtype=dtype, device=dev)
         p0_t = torch.as_tensor(p0, dtype=dtype, device=dev)
@@ -201,16 +243,20 @@ def fit_ND_fixed_cov(data, coordinates, cov, mask, device=None, n_iter=30,
         pn = params.detach().cpu().double().numpy()
         A_out[sel[:, 0], sel[:, 1]] = pn[:, 0] * ys
         mu_out[sel[:, 0], sel[:, 1]] = xc[None, :] + xs[None, :] * pn[:, 1:1 + D]
-        c_out[sel[:, 0], sel[:, 1]] = pn[:, 1 + D] * ys
+        for j, ax in enumerate(free_idx):
+            scale_out[sel[:, 0], sel[:, 1], ax] = pn[:, 1 + D + j]
+        c_out[sel[:, 0], sel[:, 1]] = pn[:, 1 + D + K] * ys
         okn = ok.detach().cpu().numpy() & (pn[:, 0] > 0)
         success[sel[:, 0], sel[:, 1]] = okn.astype(np.float64)
 
-    return {"A": A_out, "mu": mu_out, "c": c_out, "success": success}
+    return {"A": A_out, "mu": mu_out, "c": c_out, "success": success,
+            "scale": scale_out}
 
 
 def refit_edge_pixels(data, coordinates, result, status, cov=None, device=None,
                       n_iter=30, mu_pad_steps=8.0, chunk_px=1024,
-                      fallback="moments", return_source=False):
+                      fallback="moments", return_source=False,
+                      refine_widths=True, edge_bins=3):
     """Constrained refit of EDGE_CLIPPED/FAILED pixels; returns merged result.
 
     Pixels with ``status`` 2 (edge-clipped) or 3 (failed) are refit with the
@@ -228,6 +274,16 @@ def refit_edge_pixels(data, coordinates, result, status, cov=None, device=None,
         status (numpy.ndarray): (ny, nx) from classify_fit_status.
         cov (numpy.ndarray, optional): (D, D) fixed covariance override.
         device, n_iter, mu_pad_steps, chunk_px: see :func:`fit_ND_fixed_cov`.
+
+    With ``refine_widths`` (default), a second pass frees a per-axis
+    width-scale factor on every axis whose peak is fully CONTAINED for that
+    pixel (grouped by per-axis truncation pattern) — the centre is pinned by
+    stage 1, and on contained axes the width is measurable, so the refit
+    curve matches the raw data instead of carrying the grain-median width
+    everywhere. Truncated axes keep the prior width exactly (width/centre
+    degeneracy). The merged ``cov`` at refit pixels becomes
+    ``diag(s) @ cov_prior @ diag(s)``: measured on contained axes, prior on
+    truncated ones — still flagged via ``refit_mask``.
 
     Pixels where even the constrained fit fails get a ``fallback``
     estimate (default "moments"): the noise-gated weighted first moment of
@@ -268,6 +324,34 @@ def refit_edge_pixels(data, coordinates, result, status, cov=None, device=None,
     out.cov[refit_ok] = cov  # the prior, flagged via refit_mask/source
     source[refit_ok] = 2
 
+    if refine_widths and refit_ok.any():
+        D = np.asarray(coordinates).shape[0]
+        axes_edge = _per_axis_edge(data, edge_bins=edge_bins)
+        patterns = {}
+        ys_, xs_ = np.nonzero(refit_ok)
+        for yy, xx in zip(ys_, xs_):
+            key = tuple(np.nonzero(~axes_edge[yy, xx])[0])  # contained axes
+            patterns.setdefault(key, []).append((yy, xx))
+        for free_axes, pix in patterns.items():
+            if not free_axes:
+                continue  # every axis truncated: nothing is measurable
+            m = np.zeros_like(refit_ok)
+            pix = np.asarray(pix)
+            m[pix[:, 0], pix[:, 1]] = True
+            fit2 = fit_ND_fixed_cov(
+                data, coordinates, cov, m, device=device, n_iter=n_iter,
+                mu_pad_steps=mu_pad_steps, chunk_px=chunk_px,
+                free_scale_axes=free_axes,
+            )
+            ok2 = m & (fit2["success"] > 0.5) & (fit2["A"] > 0)
+            if not ok2.any():
+                continue
+            out.A[ok2] = fit2["A"][ok2]
+            out.mu[ok2] = fit2["mu"][ok2]
+            out.c[ok2] = fit2["c"][ok2]
+            sc = fit2["scale"][ok2]                       # (p, D)
+            out.cov[ok2] = sc[:, :, None] * cov[None] * sc[:, None, :]
+
     leftover = target & ~refit_ok
     if fallback == "moments" and leftover.any():
         ny, nx = target.shape
@@ -283,11 +367,45 @@ def refit_edge_pixels(data, coordinates, result, status, cov=None, device=None,
             step = float(np.median(d[d > 0])) if (d > 0).any() else 0.0
             pad = mu_pad_steps * step
             mu_m[:, i] = np.clip(mu_m[:, i], vals[0] - pad, vals[-1] + pad)
-        out.A[idx[:, 0], idx[:, 1]] = A0
+        # amplitude/background by closed-form linear least squares given the
+        # gated-moment centre and prior widths (a max-minus-baseline guess
+        # badly overshoots the model curve; LS matches it to the data)
+        Sinv_m = np.linalg.inv(cov)
+        dmat = X[None, :, :] - mu_m[:, None, :]
+        q = np.einsum("pni,ij,pnj->pn", dmat, Sinv_m, dmat)
+        e = np.exp(-0.5 * np.clip(q, None, 60.0))
+        See = (e * e).sum(1); Se = e.sum(1); n = e.shape[1]
+        Sy = y.sum(1); Sey = (e * y).sum(1)
+        det = See * n - Se * Se
+        A_ls = np.where(det > 1e-12, (Sey * n - Se * Sy) / np.where(det > 1e-12, det, 1.0), A0)
+        c_ls = np.where(det > 1e-12, (See * Sy - Se * Sey) / np.where(det > 1e-12, det, 1.0), base)
+        A_ls = np.clip(A_ls, 1e-3, None)
+        c_ls = np.clip(c_ls, 0.0, None)
+        out.A[idx[:, 0], idx[:, 1]] = A_ls
         out.mu[idx[:, 0], idx[:, 1]] = mu_m
-        out.c[idx[:, 0], idx[:, 1]] = base
+        out.c[idx[:, 0], idx[:, 1]] = c_ls
         out.cov[idx[:, 0], idx[:, 1]] = cov
         source[idx[:, 0], idx[:, 1]] = 3
 
     refit_mask = source > 0
     return (out, refit_mask, source) if return_source else (out, refit_mask)
+
+
+def refit_status_update(status, source):
+    """Reclassify after a refit: constrained-fit-resolved pixels become
+    EDGE_CLIPPED (a flagged estimate with a value), so FAILED is reserved for
+    pixels that genuinely carry no usable fit. Moment-fallback pixels
+    (source==3) keep FAILED status — their value is a weaker estimate — but
+    still display when passed via refit_mask.
+
+    Args:
+        status (numpy.ndarray): (ny, nx) int8 from classify_fit_status.
+        source (numpy.ndarray): (ny, nx) int8 from
+            ``refit_edge_pixels(..., return_source=True)``.
+
+    Returns:
+        numpy.ndarray: updated int8 copy.
+    """
+    out = np.array(status, copy=True)
+    out[np.asarray(source) == 2] = 2  # EDGE_CLIPPED: constrained estimate
+    return out

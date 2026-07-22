@@ -60,3 +60,24 @@ def test_darfix_parity():
     expected[expected > 180] = 0
     got = preprocess.thresholded(data, bottom=30, top=180)
     assert (got == expected).all()
+
+
+def test_grain_mask_robust_keeps_truncated_peaks():
+    """Union mask must keep pixels whose peak is bright but z-sum is low
+    (scan-range truncation) that a z-sum-only mask drops."""
+    rng = np.random.default_rng(11)
+    a, b, n = 24, 24, 400
+    data = rng.poisson(10, size=(a, b, n)).astype(np.uint16)
+    # full grain blob: bright peak, big z-sum
+    data[4:10, 4:10, 180:220] += 3000
+    # truncated grain blob: clear peak in only 2 frames — z-sum barely above
+    # the background level, far below the z-sum Otsu threshold
+    data[14:20, 14:20, n-2:] += 800
+
+    m_z = preprocess.grain_mask(data, method="otsu")
+    m_u, thr_z, thr_p = preprocess.grain_mask_robust(data, return_thresholds=True)
+    assert m_u[6, 6] and m_u[16, 16]          # union keeps both blobs
+    assert m_u[16, 16] and not m_z[16, 16]    # z-sum-only mask drops the truncated one
+    assert not m_u[0, 0]                      # background stays out
+    # peak threshold separates noise maxima (~20) from real peaks (~800)
+    assert 20 < thr_p < 800
