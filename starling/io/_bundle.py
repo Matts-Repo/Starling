@@ -112,7 +112,35 @@ def _dataset_provenance(dset):
                     "integrated_motors"):
             if sp.get(key) is not None:
                 prov[key] = sp[key]
+    prov.update(_geometry_provenance(dset))
     return prov
+
+
+def _geometry_provenance(dset):
+    """Sample-plane pixel geometry, so a reloaded bundle can plot to scale.
+
+    Without this a bundle carries no way to recover the ``sin(2theta)`` aspect
+    correction (``obpitch`` lives in the raw BLISS tree, which the local
+    machine does not have), and every map silently reverts to square pixels.
+    """
+    from ._geometry import TOPOGRAPHY_AXIS
+
+    try:
+        dy, dx = dset.pixel_size_yx_um
+        inv = dset._invariant_motors
+    except Exception:
+        return {}
+    out = {
+        "pixel_um_y": float(dy),
+        "pixel_um_x": float(dx),
+        "topography_axis": int(TOPOGRAPHY_AXIS),
+    }
+    try:
+        out["obpitch_deg"] = float(np.asarray(inv["obpitch"]).squeeze())
+        out["aspect_factor"] = float(dset.aspect_factor)
+    except (KeyError, TypeError, ValueError):
+        pass
+    return out
 
 
 def _write_attrs(f, attrs):
@@ -425,6 +453,37 @@ class Bundle:
     @property
     def motor_shape(self):
         return tuple(self.attrs["motor_shape"])
+
+    @property
+    def pixel_size_yx_um(self):
+        """Sample-plane ``(dy, dx)`` in micrometres, or None if not stamped.
+
+        Bundles written before the aspect correction existed carry only the
+        isotropic ``pixel_um``/``pixel_mm``; those fall back to an isotropic
+        pair here and a map plotted from them is compressed along axis 0 by
+        ``1/sin(2theta)``. Re-stamp such a bundle (see
+        ``scripts/stamp_aspect.py``) rather than trusting the fallback.
+        """
+        a = self.attrs
+        if "pixel_um_y" in a and "pixel_um_x" in a:
+            return (float(a["pixel_um_y"]), float(a["pixel_um_x"]))
+        for key, scale in (("pixel_um", 1.0), ("pixel_mm", 1e3)):
+            if key in a:
+                v = float(a[key]) * scale
+                return (v, v)
+        return None
+
+    @property
+    def aspect_factor(self):
+        """Stored ``1/sin(2theta)``, or None when the bundle predates it."""
+        a = self.attrs
+        if "aspect_factor" in a:
+            return float(a["aspect_factor"])
+        if "obpitch_deg" in a:
+            from ._geometry import aspect_factor
+
+            return aspect_factor({"obpitch": a["obpitch_deg"]})
+        return None
 
     def dense(self, fill=0):
         """The full (ny, nx, *motor_shape) cube.

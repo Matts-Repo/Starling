@@ -485,3 +485,64 @@ def test_support_count_bad_axis():
         support_count(data, motor_axis=2, threshold=0)
     with pytest.raises(ValueError, match="motor_axis"):
         support_count(data, motor_axis=-1, threshold=0)
+
+
+# --------------------------------------------------------------------------- #
+# sample-plane pixel geometry: a local bundle must carry its own aspect ratio
+# --------------------------------------------------------------------------- #
+
+_ID03_MOTORS = {"obx": 264.0, "mainx": -5000.0, "obpitch": 20.28573006359769,
+                "ffsel": -60.0}   # MA7031 fn1 2x
+
+
+def _dset_with_geometry(**overrides):
+    ds = _dset()
+    inv = dict(_ID03_MOTORS)
+    inv.update(overrides)
+    ds.reader.scan_params["invariant_motors"] = inv
+    return ds
+
+
+def test_bundle_stamps_sample_pixel_geometry(tmp_path):
+    path = tmp_path / "b.h5"
+    save_bundle(path, _dset_with_geometry(), compression=None)
+    b = load_bundle(path)
+    assert b.attrs["pixel_um_x"] == pytest.approx(0.18117, abs=1e-5)
+    assert b.attrs["pixel_um_y"] == pytest.approx(0.52255, abs=1e-4)
+    assert b.attrs["aspect_factor"] == pytest.approx(2.8843, abs=1e-3)
+    assert b.attrs["obpitch_deg"] == pytest.approx(20.28573, abs=1e-4)
+    assert b.attrs["topography_axis"] == 0
+
+
+def test_bundle_pixel_size_property_round_trips(tmp_path):
+    path = tmp_path / "b.h5"
+    dset = _dset_with_geometry()
+    save_bundle(path, dset, compression=None)
+    b = load_bundle(path)
+    assert b.pixel_size_yx_um == pytest.approx(dset.pixel_size_yx_um)
+    assert b.aspect_factor == pytest.approx(dset.aspect_factor)
+
+
+def test_bundle_without_geometry_has_no_pixel_attrs(tmp_path):
+    # no invariant motors -> no fabricated numbers, and no aspect claim
+    path = tmp_path / "b.h5"
+    with pytest.warns(UserWarning, match="ISOTROPIC"):
+        save_bundle(path, _dset(), compression=None)
+    b = load_bundle(path)
+    assert "obpitch_deg" not in b.attrs
+    assert "aspect_factor" not in b.attrs
+    assert b.aspect_factor is None
+
+
+def test_legacy_bundle_falls_back_to_isotropic(tmp_path):
+    # a bundle written before this feature carries only a scalar pixel_mm
+    path = tmp_path / "b.h5"
+    with pytest.warns(UserWarning):
+        save_bundle(path, _dset(), provenance={"pixel_mm": 0.00018117},
+                    compression=None)
+    with h5py.File(path, "r+") as f:
+        for k in ("pixel_um_y", "pixel_um_x"):
+            del f.attrs[k]
+    b = load_bundle(path)
+    assert b.pixel_size_yx_um == pytest.approx((0.18117, 0.18117))
+    assert b.aspect_factor is None

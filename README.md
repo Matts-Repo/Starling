@@ -61,6 +61,31 @@ pv   = dset.fit_1D_pseudo_voigt()           # PseudoVoigtResult
 mean, cov, skew, kurt = dset.moments(order=4)
 ```
 
+### Pixel size and the sin(2θ) aspect ratio
+
+DFXM maps are **not square-pixel images**. ID03 has a vertical scattering
+plane, so the along-beam direction in the sample (array axis 0) is
+foreshortened onto the detector by `sin(2θ)` — 2.9× at the usual 2θ of 20°.
+Plotting on square pixels silently squashes the grain by that factor; this is
+the same correction as darfix's *"Aspect ratio: divide by sin(2θ) along
+Vertical"* option (older darfix: the "Topography (obpitch)" checkbox).
+
+```python
+dset.pixel_size_um            # 0.181 um  — DETECTOR plane, isotropic
+dset.pixel_size_yx_um         # (0.523, 0.181) um  — SAMPLE plane, corrected
+dset.aspect_factor            # 2.884 = 1 / sin(obpitch), and obpitch IS 2theta
+
+imshow_map(ax, strain, pixel_size=dset.pixel_size_yx_um, unit="um")
+add_scalebar(ax)              # physical axes -> no pixel size needed
+```
+
+Use the pair for anything physical: `extent`, scale bars, grain areas, NeXus
+image axes. `save_bundle` stamps `pixel_um_y`/`pixel_um_x`/`aspect_factor`/
+`obpitch_deg` into the bundle so a machine without the raw BLISS tree can still
+recover it, and `Bundle.pixel_size_yx_um` reads it back. To back-stamp
+analyses written before this existed, run
+`scripts/apply_aspect_correction.py <data root> --apply`.
+
 ### Interactive noise-reduction preview
 
 ```python

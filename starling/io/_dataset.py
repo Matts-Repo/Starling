@@ -366,24 +366,57 @@ class DataSet:
         return self.reader.sensors
 
     @property
-    def pixel_size_um(self):
-        """Effective (sample-plane) pixel size in micrometres.
+    def _invariant_motors(self):
+        try:
+            return self.scan_params.get("invariant_motors", {})
+        except Exception:
+            return {}
 
-        Computed once from the scan's invariant obx/mainx/obpitch motors via
+    @property
+    def pixel_size_um(self):
+        """Effective pixel size in micrometres, in the DETECTOR plane (scalar).
+
+        Computed once from the scan's invariant obx/mainx/ffsel motors via
         :func:`starling.io.effective_pixel_size`; falls back to the nominal
         6.5 um sensor pitch (with a warning) when the geometry is missing.
+
+        This is isotropic and is NOT the pixel size in the sample: it omits the
+        ``1/sin(2theta)`` foreshortening of the along-beam axis. Use
+        :attr:`pixel_size_yx_um` for anything plotted or measured in sample
+        units.
         """
         cached = getattr(self, "_pixel_size_um", None)
         if cached is not None:
             return cached
         from ._geometry import effective_pixel_size
 
-        try:
-            invariant = self.scan_params.get("invariant_motors", {})
-        except Exception:
-            invariant = {}
-        self._pixel_size_um = effective_pixel_size(invariant)
+        self._pixel_size_um = effective_pixel_size(self._invariant_motors)
         return self._pixel_size_um
+
+    @property
+    def pixel_size_yx_um(self):
+        """Sample-plane pixel size ``(dy, dx)`` in micrometres, aspect-corrected.
+
+        :attr:`pixel_size_um` with the detector-vertical axis (array axis 0)
+        divided by ``sin(obpitch)`` to undo the projection of the illuminated
+        sample sheet onto the tilted detector — see
+        :func:`starling.io.sample_pixel_size`. This is the pair that
+        ``extent=``, scale bars and physical grain sizes want.
+        """
+        cached = getattr(self, "_pixel_size_yx_um", None)
+        if cached is not None:
+            return cached
+        from ._geometry import sample_pixel_size
+
+        self._pixel_size_yx_um = sample_pixel_size(self._invariant_motors)
+        return self._pixel_size_yx_um
+
+    @property
+    def aspect_factor(self):
+        """``1 / sin(2theta)`` — how much axis 0 is stretched vs axis 1."""
+        from ._geometry import aspect_factor
+
+        return aspect_factor(self._invariant_motors)
 
     def info(self):
         if self.data is not None:
