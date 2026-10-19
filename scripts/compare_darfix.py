@@ -188,7 +188,7 @@ def _geo_mean_spread(fwhm_list):
 DARFIX_INSTALL_HINT = (
     "darfix is not importable in this environment.\n"
     "Install it into the starling venv with:\n"
-    '    pip install -e "/Users/matt/Lab/projects/DFXM/darfix new" \\\n'
+    '    pip install -e "../other-peoples-code/darfix" \\\n'
     "        scikit-image opencv-python-headless\n"
     "or, on the ESRF cluster, `module load darfix` (darfix is preinstalled).\n"
     "Re-run with --no-darfix to characterise the starling side only."

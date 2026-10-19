@@ -12,13 +12,19 @@ validation gate, not a CI test.
 """
 
 import os
+from pathlib import Path
 
 import numpy as np
 import pytest
 
-BUNDLE = (
-    "/Users/matt/Lab/projects/DFXM/MA7031 example data/26-07-20 bad fit/"
-    "mosa_strain_2x_layer_scan_FN1_BC_002/bundle.h5"
+# Example bundles live outside the repo, next to it in the DFXM working tree.
+# DFXM_DATA_ROOT overrides for a checkout somewhere else (e.g. the cluster).
+_DATA_ROOT = Path(
+    os.environ.get("DFXM_DATA_ROOT", Path(__file__).resolve().parents[2] / "data")
+)
+BUNDLE = str(
+    _DATA_ROOT / "MA7031" / "2026-07-20-bad-fit"
+    / "mosa_strain_2x_layer_scan_FN1_BC_002" / "bundle.h5"
 )
 
 pytestmark = [

@@ -65,6 +65,8 @@ class ID03:
             "diffrz": "instrument/diffrz/data",
             "diffry": "instrument/diffry/data",
             "diffrx": "instrument/diffrx/data",
+            "difftz": "instrument/difftz/value",   # MA6043 (2024) sample z used in fscan2d difftz x diffry z-meshes
+            "diffty": "instrument/diffty/value",
             "omega": "instrument/positioners/omega",
             "ux": "instrument/positioners/ux",
             "uy": "instrument/positioners/uy",
@@ -99,6 +101,12 @@ class ID03:
             self.motor_map["uy"]: "instrument/positioners/samy",
             self.motor_map["uz"]: "instrument/positioners/samz",
             self.motor_map["omega"]: "instrument/omega/data",
+            # MA6043 (June 2024 BLISS): ascan/fscan/amesh store the scanned
+            # diffry/diffrz under instrument/<motor>/value; only fscan2d has /data
+            self.motor_map["diffry"]: "instrument/diffry/value",
+            self.motor_map["diffrz"]: "instrument/diffrz/value",
+            self.motor_map["difftz"]: "instrument/difftz/data",
+            self.motor_map["diffty"]: "instrument/diffty/data",
         }
 
         # independent sensors stored under the .2 layer (1.2, 2.2, ...)
